@@ -2041,6 +2041,37 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.sampling.grammar = json_schema_to_grammar(json::parse(schema));
         }
     ).set_sparam());
+
+    // DeepConf: confidence-based early stopping parameters
+    add_opt(common_arg(
+        {"--deepconf"},
+        "enable DeepConf confidence-based early stopping (default: false)",
+        [](common_params & params) {
+            params.sampling.deepconf_enabled = true;
+        }
+    ).set_sparam());
+    add_opt(common_arg(
+        {"--deepconf-window"}, "N",
+        string_format("DeepConf sliding window size for group confidence (default: %d)", params.sampling.deepconf_window_size),
+        [](common_params & params, int value) {
+            params.sampling.deepconf_window_size = std::max(1, std::min(2048, value));
+        }
+    ).set_sparam());
+    add_opt(common_arg(
+        {"--deepconf-threshold"}, "N",
+        string_format("DeepConf confidence threshold for early stopping (default: %.1f)", (double)params.sampling.deepconf_threshold),
+        [](common_params & params, const std::string & value) {
+            params.sampling.deepconf_threshold = std::max(0.1f, std::min(2.0f, std::stof(value)));
+        }
+    ).set_sparam());
+    add_opt(common_arg(
+        {"--deepconf-top-k"}, "N",
+        string_format("DeepConf number of top tokens for confidence calculation (default: %d)", params.sampling.deepconf_top_k),
+        [](common_params & params, int value) {
+            params.sampling.deepconf_top_k = std::max(1, std::min(40, value));
+        }
+    ).set_sparam());
+
     add_opt(common_arg(
         {"--pooling"}, "{none,mean,cls,last,rank}",
         "pooling type for embeddings, use model default if unspecified",

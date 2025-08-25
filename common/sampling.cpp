@@ -1,4 +1,5 @@
 #include "sampling.h"
+#include "deepconf.h"
 
 #include "common.h"
 #include "log.h"
@@ -112,6 +113,9 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    // DeepConf state for confidence-based early stopping
+    deepconf_state * deepconf;
+
     void set_logits(struct llama_context * ctx, int idx) {
         const auto * logits = llama_get_logits_ith(ctx, idx);
 
@@ -137,11 +141,13 @@ std::string common_params_sampling::print() const {
             "\trepeat_last_n = %d, repeat_penalty = %.3f, frequency_penalty = %.3f, presence_penalty = %.3f\n"
             "\tdry_multiplier = %.3f, dry_base = %.3f, dry_allowed_length = %d, dry_penalty_last_n = %d\n"
             "\ttop_k = %d, top_p = %.3f, min_p = %.3f, xtc_probability = %.3f, xtc_threshold = %.3f, typical_p = %.3f, top_n_sigma = %.3f, temp = %.3f\n"
-            "\tmirostat = %d, mirostat_lr = %.3f, mirostat_ent = %.3f",
+            "\tmirostat = %d, mirostat_lr = %.3f, mirostat_ent = %.3f\n"
+            "\tdeepconf_enabled = %s, deepconf_window_size = %d, deepconf_threshold = %.3f, deepconf_top_k = %d",
             penalty_last_n, penalty_repeat, penalty_freq, penalty_present,
             dry_multiplier, dry_base, dry_allowed_length, dry_penalty_last_n,
             top_k, top_p, min_p, xtc_probability, xtc_threshold, typ_p, top_n_sigma, temp,
-            mirostat, mirostat_eta, mirostat_tau);
+            mirostat, mirostat_eta, mirostat_tau,
+            deepconf_enabled ? "true" : "false", deepconf_window_size, deepconf_threshold, deepconf_top_k);
 
     return std::string(result);
 }
@@ -220,6 +226,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, co
         /* .prev   = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur    = */ {},
         /* .cur_p  = */ {},
+        /* .deepconf = */ nullptr,
     };
 
     llama_sampler_chain_add(result->chain,
@@ -284,6 +291,14 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, co
         GGML_ASSERT(false && "unknown mirostat version");
     }
 
+    // Initialize DeepConf state if enabled
+    deepconf_params deepconf_p;
+    deepconf_p.enabled = params.deepconf_enabled;
+    deepconf_p.window_size = (size_t)params.deepconf_window_size;
+    deepconf_p.threshold = params.deepconf_threshold;
+    deepconf_p.top_k = params.deepconf_top_k;
+    result->deepconf = deepconf_init(deepconf_p);
+
     return result;
 }
 
@@ -292,6 +307,8 @@ void common_sampler_free(struct common_sampler * gsmpl) {
         llama_sampler_free(gsmpl->grmr);
 
         llama_sampler_free(gsmpl->chain);
+
+        deepconf_free(gsmpl->deepconf);
 
         delete gsmpl;
     }
@@ -311,17 +328,34 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
     llama_sampler_reset(gsmpl->grmr);
 
     llama_sampler_reset(gsmpl->chain);
+
+    if (gsmpl->deepconf) {
+        deepconf_reset(gsmpl->deepconf);
+    }
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
-    return new common_sampler {
+    auto * cloned = new common_sampler {
         /* .params = */ gsmpl->params,
         /* .grmr   = */ llama_sampler_clone(gsmpl->grmr),
         /* .chain  = */ llama_sampler_clone(gsmpl->chain),
         /* .prev   = */ gsmpl->prev,
         /* .cur    = */ gsmpl->cur,
         /* .cur_p  = */ gsmpl->cur_p,
+        /* .deepconf = */ nullptr,
     };
+
+    // Clone DeepConf state (initialize new state with same parameters)
+    if (gsmpl->deepconf) {
+        deepconf_params deepconf_p;
+        deepconf_p.enabled = gsmpl->params.deepconf_enabled;
+        deepconf_p.window_size = (size_t)gsmpl->params.deepconf_window_size;
+        deepconf_p.threshold = gsmpl->params.deepconf_threshold;
+        deepconf_p.top_k = gsmpl->params.deepconf_top_k;
+        cloned->deepconf = deepconf_init(deepconf_p);
+    }
+
+    return cloned;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -365,6 +399,10 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
         const bool is_valid = single_token_data_array.data[0].logit != -INFINITY;
         if (is_valid) {
+            // Update DeepConf confidence tracking
+            if (gsmpl->deepconf) {
+                deepconf_process_token(gsmpl->deepconf, &cur_p);
+            }
             return id;
         }
     }
@@ -377,6 +415,11 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     llama_sampler_apply(chain, &cur_p);
 
     GGML_ASSERT(cur_p.selected != -1 && "no selected token during re-sampling - check your sampling configuration");
+
+    // Update DeepConf confidence tracking
+    if (gsmpl->deepconf) {
+        deepconf_process_token(gsmpl->deepconf, &cur_p);
+    }
 
     return cur_p.data[cur_p.selected].id;
 }
@@ -576,4 +619,40 @@ std::vector<common_sampler_type> common_sampler_types_from_chars(const std::stri
     }
 
     return samplers;
+}
+
+// DeepConf helper function implementations
+
+bool common_sampler_should_stop(const struct common_sampler * gsmpl) {
+    if (!gsmpl || !gsmpl->deepconf) {
+        return false;
+    }
+    return deepconf_should_stop(gsmpl->deepconf);
+}
+
+float common_sampler_get_confidence(const struct common_sampler * gsmpl) {
+    if (!gsmpl || !gsmpl->deepconf) {
+        return 0.0f;
+    }
+    return deepconf_get_group_confidence(gsmpl->deepconf);
+}
+
+std::string common_sampler_deepconf_stats(const struct common_sampler * gsmpl) {
+    if (!gsmpl || !gsmpl->deepconf) {
+        return "DeepConf: disabled";
+    }
+    
+    deepconf_stats stats = deepconf_get_stats(gsmpl->deepconf);
+    std::ostringstream oss;
+    
+    oss << "DeepConf: enabled=" << (stats.params.enabled ? "true" : "false")
+        << ", window=" << stats.params.window_size
+        << ", threshold=" << stats.params.threshold
+        << ", top_k=" << stats.params.top_k
+        << ", tokens_processed=" << stats.tokens_processed
+        << ", last_token_conf=" << stats.last_token_confidence
+        << ", group_conf=" << stats.last_group_confidence
+        << ", should_stop=" << (stats.early_stop_triggered ? "true" : "false");
+    
+    return oss.str();
 }

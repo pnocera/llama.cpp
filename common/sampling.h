@@ -98,6 +98,17 @@ std::string common_sampler_print(const struct common_sampler * gsmpl);
 std::string common_sampler_prev_str(common_sampler * gsmpl, llama_context * ctx, int n);
 
 char        common_sampler_type_to_chr(enum common_sampler_type cnstr);
+
+// DeepConf: confidence-based early stopping helpers
+
+// check if early stopping should occur based on current confidence state
+bool common_sampler_should_stop(const struct common_sampler * gsmpl);
+
+// get current group confidence for monitoring
+float common_sampler_get_confidence(const struct common_sampler * gsmpl);
+
+// get DeepConf statistics for debugging
+std::string common_sampler_deepconf_stats(const struct common_sampler * gsmpl);
 std::string common_sampler_type_to_str(enum common_sampler_type cnstr);
 
 std::vector<enum common_sampler_type> common_sampler_types_from_names(const std::vector<std::string> & names, bool allow_alt_names);
