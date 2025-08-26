@@ -1,0 +1,14 @@
+llama-server \
+    -m /home/pierre/models/gptoss/gpt-oss-120b/gpt-oss-120b-mxfp4-00001-of-00003.gguf --alias gptoss \
+    --jinja \
+    --port 8083 \
+    --ctx-size 0 \
+    --n-gpu-layers 99 \
+    --flash-attn \
+    --batch-size 2048 \
+    --mlock \
+    --threads 16 \
+    --deepconf \
+    --deepconf-threshold 0.6 \
+    --deepconf-window 16 \
+    --deepconf-top-k 6 
