@@ -2059,16 +2059,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_sparam());
     add_opt(common_arg(
         {"--deepconf-threshold"}, "N",
-        string_format("DeepConf confidence threshold for early stopping (default: %.1f)", (double)params.sampling.deepconf_threshold),
+        string_format("DeepConf confidence threshold for early stopping (default: %.1f, range: 0.1-100.0)", (double)params.sampling.deepconf_threshold),
         [](common_params & params, const std::string & value) {
-            params.sampling.deepconf_threshold = std::max(0.1f, std::min(2.0f, std::stof(value)));
+            params.sampling.deepconf_threshold = std::max(0.1f, std::min(100.0f, std::stof(value)));
         }
     ).set_sparam());
     add_opt(common_arg(
         {"--deepconf-top-k"}, "N",
-        string_format("DeepConf number of top tokens for confidence calculation (default: %d)", params.sampling.deepconf_top_k),
+        string_format("DeepConf number of runner-up tokens (beta) used for confidence calculation (default: %d)", params.sampling.deepconf_top_k),
         [](common_params & params, int value) {
-            params.sampling.deepconf_top_k = std::max(1, std::min(40, value));
+            // Require at least 2 to ensure one runner-up after excluding the winning token
+            params.sampling.deepconf_top_k = std::max(2, std::min(40, value));
         }
     ).set_sparam());
 

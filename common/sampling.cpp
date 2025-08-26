@@ -8,99 +8,6 @@
 #include <unordered_map>
 #include <algorithm>
 
-// the ring buffer works similarly to std::deque, but with a fixed capacity
-// TODO: deduplicate with llama-impl.h
-template<typename T>
-struct ring_buffer {
-    ring_buffer(size_t cap) : capacity(cap), data(cap) {}
-
-    T & front() {
-        if (sz == 0) {
-            throw std::runtime_error("ring buffer is empty");
-        }
-        return data[first];
-    }
-
-    const T & front() const {
-        if (sz == 0) {
-            throw std::runtime_error("ring buffer is empty");
-        }
-        return data[first];
-    }
-
-    T & back() {
-        if (sz == 0) {
-            throw std::runtime_error("ring buffer is empty");
-        }
-        return data[pos];
-    }
-
-    const T & back() const {
-        if (sz == 0) {
-            throw std::runtime_error("ring buffer is empty");
-        }
-        return data[pos];
-    }
-
-    void push_back(const T & value) {
-        if (sz == capacity) {
-            // advance the start when buffer is full
-            first = (first + 1) % capacity;
-        } else {
-            sz++;
-        }
-        data[pos] = value;
-        pos = (pos + 1) % capacity;
-    }
-
-    T pop_front() {
-        if (sz == 0) {
-            throw std::runtime_error("ring buffer is empty");
-        }
-        T value = data[first];
-        first = (first + 1) % capacity;
-        sz--;
-        return value;
-    }
-
-    const T & rat(size_t i) const {
-        if (i >= sz) {
-            throw std::runtime_error("ring buffer: index out of bounds");
-        }
-        return data[(first + sz - i - 1) % capacity];
-    }
-
-    std::vector<T> to_vector() const {
-        std::vector<T> result;
-        result.reserve(sz);
-        for (size_t i = 0; i < sz; i++) {
-            result.push_back(data[(first + i) % capacity]);
-        }
-        return result;
-    }
-
-    void clear() {
-        // here only reset the status of the buffer
-        sz = 0;
-        first = 0;
-        pos = 0;
-    }
-
-    bool empty() const {
-        return sz == 0;
-    }
-
-    size_t size() const {
-        return sz;
-    }
-
-    size_t capacity = 0;
-    size_t sz = 0;
-    size_t first = 0;
-    size_t pos = 0;
-    std::vector<T> data;
-};
-
 struct common_sampler {
     common_params_sampling params;
 
@@ -292,12 +199,21 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, co
     }
 
     // Initialize DeepConf state if enabled
-    deepconf_params deepconf_p;
-    deepconf_p.enabled = params.deepconf_enabled;
-    deepconf_p.window_size = (size_t)params.deepconf_window_size;
-    deepconf_p.threshold = params.deepconf_threshold;
-    deepconf_p.top_k = params.deepconf_top_k;
-    result->deepconf = deepconf_init(deepconf_p);
+    if (params.deepconf_enabled) {
+        // Initialize DeepConf state if enabled
+        deepconf_params deepconf_p;
+        deepconf_p.enabled = params.deepconf_enabled;
+        deepconf_p.window_size = (size_t)params.deepconf_window_size;
+        deepconf_p.threshold = params.deepconf_threshold;
+        deepconf_p.top_k = (size_t)params.deepconf_top_k;
+        result->deepconf = deepconf_init(deepconf_p);
+        
+        if (!result->deepconf) {
+            LOG_WRN("DeepConf initialization returned nullptr despite being enabled\n");
+        }
+    } else {
+        result->deepconf = nullptr;
+    }
 
     return result;
 }
@@ -401,7 +317,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         if (is_valid) {
             // Update DeepConf confidence tracking
             if (gsmpl->deepconf) {
-                deepconf_process_token(gsmpl->deepconf, &cur_p);
+                deepconf_process_token(gsmpl->deepconf, &cur_p, id);
             }
             return id;
         }
@@ -418,7 +334,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     // Update DeepConf confidence tracking
     if (gsmpl->deepconf) {
-        deepconf_process_token(gsmpl->deepconf, &cur_p);
+        deepconf_process_token(gsmpl->deepconf, &cur_p, cur_p.data[cur_p.selected].id);
     }
 
     return cur_p.data[cur_p.selected].id;

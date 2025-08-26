@@ -188,8 +188,8 @@ struct common_params_sampling {
     // DeepConf: confidence-based early stopping parameters
     bool    deepconf_enabled      = false; // enable DeepConf early stopping
     int32_t deepconf_window_size  = 8;     // sliding window size for group confidence (1-2048)
-    float   deepconf_threshold    = 0.8f;  // confidence threshold for early stopping (0.1-2.0)
-    int32_t deepconf_top_k        = 4;     // number of top tokens for confidence calculation (1-40)
+    float   deepconf_threshold    = 0.8f;  // confidence threshold for early stopping (0.1-100.0)
+    int32_t deepconf_top_k        = 4;     // number of runner-up tokens for confidence calculation (1-40)
 
     // print the parameters into a string
     std::string print() const;

@@ -2,113 +2,16 @@
 #include "log.h"
 
 #include <algorithm>
+#include <vector>
 #include <cstdio>
 #include <stdexcept>
 #include <sstream>
-
-// Import ring_buffer template from sampling.cpp
-// TODO: This should ideally be moved to a common header to avoid duplication
-template<typename T>
-struct ring_buffer {
-    ring_buffer(size_t cap) : capacity(cap), data(cap) {}
-
-    T & front() {
-        if (sz == 0) {
-            throw std::runtime_error("ring buffer is empty");
-        }
-        return data[first];
-    }
-
-    const T & front() const {
-        if (sz == 0) {
-            throw std::runtime_error("ring buffer is empty");
-        }
-        return data[first];
-    }
-
-    T & back() {
-        if (sz == 0) {
-            throw std::runtime_error("ring buffer is empty");
-        }
-        return data[pos];
-    }
-
-    const T & back() const {
-        if (sz == 0) {
-            throw std::runtime_error("ring buffer is empty");
-        }
-        return data[pos];
-    }
-
-    void push_back(const T & value) {
-        if (sz == capacity) {
-            // advance the start when buffer is full
-            first = (first + 1) % capacity;
-        } else {
-            sz++;
-        }
-        data[pos] = value;
-        pos = (pos + 1) % capacity;
-    }
-
-    T pop_front() {
-        if (sz == 0) {
-            throw std::runtime_error("ring buffer is empty");
-        }
-        T value = data[first];
-        first = (first + 1) % capacity;
-        sz--;
-        return value;
-    }
-
-    const T & rat(size_t i) const {
-        if (i >= sz) {
-            throw std::runtime_error("ring buffer: index out of bounds");
-        }
-        return data[(first + sz - i - 1) % capacity];
-    }
-
-    std::vector<T> to_vector() const {
-        std::vector<T> result;
-        result.reserve(sz);
-        for (size_t i = 0; i < sz; i++) {
-            result.push_back(data[(first + i) % capacity]);
-        }
-        return result;
-    }
-
-    void clear() {
-        // here only reset the status of the buffer
-        sz = 0;
-        first = 0;
-        pos = 0;
-    }
-
-    bool empty() const {
-        return sz == 0;
-    }
-
-    size_t size() const {
-        return sz;
-    }
-
-    size_t capacity = 0;
-    size_t sz = 0;
-    size_t first = 0;
-    size_t pos = 0;
-    std::vector<T> data;
-};
 
 //
 // DeepConf state implementation
 //
 
-deepconf_state::deepconf_state(const deepconf_params & p) : params(p) {
-    confidence_window = new ring_buffer<float>(params.window_size);
-    should_stop = false;
-    last_token_confidence = 0.0f;
-    last_group_confidence = 0.0f;
-    tokens_processed = 0;
+deepconf_state::deepconf_state(const deepconf_params & p) : params(p), confidence_window(new ring_buffer<float>(p.window_size)), window_sum(0.0), should_stop(false), last_token_confidence(0.0f), last_group_confidence(0.0f), tokens_processed(0) {
 }
 
 deepconf_state::~deepconf_state() {
@@ -120,20 +23,43 @@ deepconf_state::~deepconf_state() {
 //
 
 deepconf_state * deepconf_init(const deepconf_params & params) {
+    LOG_DBG("DeepConf init called with enabled:%s, window_size:%zu, threshold:%f, top_k:%d\n",
+            params.enabled ? "true" : "false", params.window_size, params.threshold, params.top_k);
+
     // Validate parameters
     deepconf_params validated_params = params;
-    if (!deepconf_validate_params(validated_params)) {
+    bool params_valid = deepconf_validate_params(validated_params);
+    if (!params_valid) {
         LOG_WRN("DeepConf parameters were adjusted to valid ranges\n");
     }
 
+    LOG_DBG("DeepConf validated params: enabled:%s, window_size:%zu, threshold:%f, top_k:%d\n",
+            validated_params.enabled ? "true" : "false", validated_params.window_size, validated_params.threshold, validated_params.top_k);
+
     if (!validated_params.enabled) {
+        LOG_DBG("DeepConf returning nullptr because enabled is false\n");
         return nullptr; // No state needed when disabled
     }
 
+    // Additional validation to ensure parameters are reasonable
+    if (validated_params.window_size == 0) {
+        LOG_ERR("DeepConf window_size is zero, disabling DeepConf\n");
+        return nullptr;
+    }
+    
+    if (validated_params.top_k <= 0) {
+        LOG_ERR("DeepConf top_k is invalid (%d), disabling DeepConf\n", validated_params.top_k);
+        return nullptr;
+    }
+
     try {
+        LOG_DBG("Creating new deepconf_state with enabled:%s\n", validated_params.enabled ? "true" : "false");
         return new deepconf_state(validated_params);
     } catch (const std::exception & e) {
         LOG_ERR("Failed to initialize DeepConf state: %s\n", e.what());
+        return nullptr;
+    } catch (...) {
+        LOG_ERR("Failed to initialize DeepConf state: unknown exception\n");
         return nullptr;
     }
 }
@@ -146,6 +72,7 @@ void deepconf_reset(deepconf_state * state) {
     if (!state) return;
     
     state->confidence_window->clear();
+    state->window_sum = 0.0;
     state->should_stop = false;
     state->last_token_confidence = 0.0f;
     state->last_group_confidence = 0.0f;
@@ -153,39 +80,64 @@ void deepconf_reset(deepconf_state * state) {
 }
 
 float deepconf_calculate_token_confidence(
-    const llama_token_data_array * candidates, 
+    const llama_token_data_array * candidates,
+    llama_token winning_token,
     int top_k
 ) {
+    // "top_k" here is the number of runner-up tokens (beta) to average over.
+    // We compute the top "beta" tokens by probability, excluding the sampled token.
     if (!candidates || candidates->size == 0) {
         return 0.0f;
     }
 
-    // Use provided top_k or fallback to all candidates
-    int k = (top_k > 0) ? top_k : (int)candidates->size;
-    k = std::min(k, (int)candidates->size);
+    // beta = number of runner-up tokens requested
+    int beta = top_k > 0 ? top_k : (int) candidates->size;
 
-    if (k <= 0) {
+    // Collect valid candidates (probability in (0, 1]) as (p, index)
+    std::vector<std::pair<float, int>> pool;
+    pool.reserve(candidates->size);
+    for (int i = 0; i < (int) candidates->size; ++i) {
+        const float p = candidates->data[i].p;
+        if (p > 0.0f && p <= 1.0f) {
+            pool.emplace_back(p, i);
+        }
+    }
+    if (pool.empty()) {
         return 0.0f;
     }
 
-    // Calculate sum of log probabilities of top-k tokens
+    // We only need the top (beta + 1) elements to gather up to "beta" runner-ups after skipping winner.
+    // If pool is smaller, clamp accordingly.
+    const int need = std::min((int) pool.size(), beta + 1);
+
+    if ((int) pool.size() > need) {
+        std::partial_sort(
+            pool.begin(), pool.begin() + need, pool.end(),
+            [](const auto & a, const auto & b) { return a.first > b.first; });
+        pool.resize(need);
+    } else {
+        std::sort(pool.begin(), pool.end(),
+                  [](const auto & a, const auto & b) { return a.first > b.first; });
+    }
+
+    // Sum log-probs of the first "beta" non-winning tokens from the sorted head
     float sum_log_probs = 0.0f;
-    int valid_tokens = 0;
-
-    for (int i = 0; i < k; i++) {
-        float prob = candidates->data[i].p;
-        if (prob > 0.0f && prob <= 1.0f) { // Validate probability
-            sum_log_probs += logf(prob);
-            valid_tokens++;
+    int   taken = 0;
+    for (int j = 0; j < (int) pool.size() && taken < beta; ++j) {
+        const int idx = pool[j].second;
+        const llama_token tok = candidates->data[idx].id;
+        if (tok == winning_token) {
+            continue;
         }
+        sum_log_probs += logf(pool[j].first);
+        taken++;
     }
 
-    // Return negative average log probability (higher = less confident)
-    if (valid_tokens > 0) {
-        return -sum_log_probs / valid_tokens;
+    if (taken == 0) {
+        return 0.0f;
     }
-    
-    return 0.0f;
+
+    return -sum_log_probs / (float) taken;
 }
 
 bool deepconf_update(deepconf_state * state, float token_confidence) {
@@ -197,31 +149,41 @@ bool deepconf_update(deepconf_state * state, float token_confidence) {
     state->last_token_confidence = token_confidence;
     state->tokens_processed++;
     
-    // Add to sliding window
+    // Maintain O(1) rolling sum and sliding window
+    if (state->confidence_window->size() == state->params.window_size) {
+        // buffer full: evict oldest and adjust rolling sum
+        float oldest = state->confidence_window->front();
+        state->window_sum -= static_cast<double>(oldest);
+        state->confidence_window->pop_front();
+    }
     state->confidence_window->push_back(token_confidence);
-    
+    state->window_sum += static_cast<double>(token_confidence);
+
     // Calculate group confidence (average of window)
-    if (state->confidence_window->empty()) {
+    const size_t count = state->confidence_window->size();
+    if (count == 0) {
         state->last_group_confidence = 0.0f;
     } else {
-        float sum = 0.0f;
-        size_t count = state->confidence_window->size();
-        
-        for (size_t i = 0; i < count; i++) {
-            sum += state->confidence_window->rat(i);
-        }
-        
-        state->last_group_confidence = sum / count;
+        state->last_group_confidence = static_cast<float>(state->window_sum / static_cast<double>(count));
     }
     
     // Check if we should stop based on confidence threshold
+    // Log detailed information about the check
+    LOG_INF("DeepConf Update: window_fill=%zu/%zu, group_conf=%.6f, threshold=%.6f\n",
+               count, state->params.window_size, state->last_group_confidence, state->params.threshold);
     bool should_continue = true;
-    if (state->confidence_window->size() >= state->params.window_size) {
+    if (count >= state->params.window_size) {
         // Only check threshold once window is full
+        LOG_INF("DeepConf Update: Window full, checking threshold...\n");
         if (state->last_group_confidence < state->params.threshold) {
+            LOG_INF("DeepConf Update: Triggering early stop (group_conf < threshold)\n");
             state->should_stop = true;
             should_continue = false;
+        } else {
+            LOG_INF("DeepConf Update: Not stopping (group_conf >= threshold)\n");
         }
+    } else {
+        LOG_INF("DeepConf Update: Window not full yet, not checking threshold\n");
     }
     
     return should_continue;
@@ -229,14 +191,18 @@ bool deepconf_update(deepconf_state * state, float token_confidence) {
 
 bool deepconf_process_token(
     deepconf_state * state,
-    const llama_token_data_array * candidates
+    const llama_token_data_array * candidates,
+    llama_token winning_token
 ) {
     if (!state || !state->params.enabled) {
         return true; // Continue generation
     }
 
     // Calculate token confidence
-    float confidence = deepconf_calculate_token_confidence(candidates, state->params.top_k);
+    float confidence = deepconf_calculate_token_confidence(candidates, winning_token, state->params.top_k);
+    
+    // Log detailed confidence information
+    LOG_INF("DeepConf: Token %d, Calculated confidence: %.6f\n", winning_token, confidence);
     
     // Update state and get continuation decision
     return deepconf_update(state, confidence);
@@ -265,7 +231,7 @@ deepconf_stats deepconf_get_stats(const deepconf_state * state) {
         stats.tokens_processed = state->tokens_processed;
         stats.last_token_confidence = state->last_token_confidence;
         stats.last_group_confidence = state->last_group_confidence;
-        stats.window_fill_level = state->confidence_window ? state->confidence_window->size() : 0;
+        stats.window_fill_level = state->confidence_window->size();
         stats.early_stop_triggered = state->should_stop;
         stats.params = state->params;
     }
@@ -289,14 +255,14 @@ bool deepconf_validate_params(deepconf_params & params) {
     if (params.threshold < 0.1f) {
         params.threshold = 0.1f;
         was_valid = false;
-    } else if (params.threshold > 2.0f) {
-        params.threshold = 2.0f;
+    } else if (params.threshold > 100.0f) {
+        params.threshold = 100.0f;
         was_valid = false;
     }
     
     // Validate and clamp top_k
-    if (params.top_k < 1) {
-        params.top_k = 1;
+    if (params.top_k < 2) {
+        params.top_k = 2;
         was_valid = false;
     } else if (params.top_k > 40) {
         params.top_k = 40;
@@ -329,8 +295,8 @@ void deepconf_print_state(const deepconf_state * state) {
     printf("  tokens_processed: %zu\n", state->tokens_processed);
     printf("  last_token_confidence: %.6f\n", state->last_token_confidence);
     printf("  last_group_confidence: %.6f\n", state->last_group_confidence);
-    printf("  window_fill_level: %zu/%zu\n", 
-           state->confidence_window ? state->confidence_window->size() : 0,
+    printf("  window_fill_level: %zu/%zu\n",
+           state->confidence_window->size(),
            state->params.window_size);
     printf("  should_stop: %s\n", state->should_stop ? "true" : "false");
 }
