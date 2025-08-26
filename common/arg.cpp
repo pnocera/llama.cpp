@@ -2073,6 +2073,45 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_sparam());
 
+    // DeepConf: Offline Warmup parameters
+    add_opt(common_arg(
+        {"--deepconf-warmup-enabled"},
+        "enable DeepConf Offline Warmup for dynamic threshold (default: false)",
+        [](common_params & params) {
+            params.sampling.deepconf_warmup_enabled = true;
+        }
+    ).set_sparam());
+    add_opt(common_arg(
+        {"--deepconf-warmup-traces"}, "N",
+        string_format("DeepConf number of traces to run for warmup (default: %d)", params.sampling.deepconf_warmup_traces),
+        [](common_params & params, int value) {
+            params.sampling.deepconf_warmup_traces = std::max(1, value);
+        }
+    ).set_sparam());
+    add_opt(common_arg(
+        {"--deepconf-warmup-percentile"}, "N",
+        string_format("DeepConf percentile for dynamic threshold (default: %d, range: 0-100)", params.sampling.deepconf_warmup_percentile),
+        [](common_params & params, int value) {
+            params.sampling.deepconf_warmup_percentile = std::max(0, std::min(100, value));
+        }
+    ).set_sparam());
+
+    // DeepConf: Ensemble Consensus parameters
+    add_opt(common_arg(
+        {"--deepconf-ensemble-enabled"},
+        "enable DeepConf Ensemble Consensus Stop (default: false)",
+        [](common_params & params) {
+            params.sampling.deepconf_ensemble_enabled = true;
+        }
+    ).set_sparam());
+    add_opt(common_arg(
+        {"--deepconf-consensus-threshold"}, "N",
+        string_format("DeepConf consensus threshold for early stopping (default: %.2f, range: 0.0-1.0)", (double)params.sampling.deepconf_consensus_threshold),
+        [](common_params & params, const std::string & value) {
+            params.sampling.deepconf_consensus_threshold = std::max(0.0f, std::min(1.0f, std::stof(value)));
+        }
+    ).set_sparam());
+
     add_opt(common_arg(
         {"--pooling"}, "{none,mean,cls,last,rank}",
         "pooling type for embeddings, use model default if unspecified",

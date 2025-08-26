@@ -14,6 +14,8 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <numeric>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
@@ -472,6 +474,97 @@ int main(int argc, char ** argv) {
     LOG_INF("sampler params: \n%s\n", sparams.print().c_str());
     LOG_INF("sampler chain: %s\n",    common_sampler_print(smpl).c_str());
 
+    // Offline Warmup (Method A)
+    if (sparams.deepconf_warmup_enabled && !params.interactive) {
+        LOG_INF("Starting Offline Warmup with %d traces and %d%% percentile\n", sparams.deepconf_warmup_traces, sparams.deepconf_warmup_percentile);
+        
+        // Store initial prompt size to restore after each trace
+        const int32_t initial_prompt_size = embd_inp.size();
+        
+        std::vector<float> c_least_values;
+        c_least_values.reserve(sparams.deepconf_warmup_traces);
+        
+        // Run warmup traces
+        for (int i = 0; i < sparams.deepconf_warmup_traces; ++i) {
+            LOG_INF("Running warmup trace %d/%d\n", i + 1, sparams.deepconf_warmup_traces);
+            
+            // Reset sampler's DeepConf state for this trace
+            common_sampler_deepconf_reset(smpl);
+            // Clear current trace tokens before starting a new trace
+            common_sampler_deepconf_clear_current_trace_tokens(smpl);
+            
+            // Enable warmup collection mode
+            common_sampler_deepconf_set_warmup_mode(smpl, deepconf_state::DEEPCONF_WARMUP_MODE_COLLECT);
+            
+            // Generate tokens up to n_predict limit or context window (whichever comes first)
+            int n_rem = params.n_predict;
+            
+            llama_token id = 0;
+            while (n_rem > 0) {
+                llama_token_data_array * candidates = common_sampler_get_candidates(smpl);
+                const float confidence = common_sampler_sample_with_confidence(smpl, ctx, candidates, &id);
+                
+                // Accept the predicted token into the context
+                common_sampler_accept(smpl, id, true);
+                
+                // Decrement remaining tokens count
+                n_rem--;
+                
+                // Check if we've hit the context window limit
+                if (llama_memory_seq_pos_max(mem, 0) + 1 >= llama_n_ctx(ctx)) {
+                    LOG_INF("Context window filled during warmup trace.\n");
+                    break;
+                }
+                
+                // Check for end of generation conditions
+                if (id == llama_vocab_eos(vocab)) {
+                    break;
+                }
+            }
+            
+            // Extract C_least value from this trace
+            const float trace_c_least = common_sampler_deepconf_get_min_group_confidence(smpl);
+            if (trace_c_least > 0.0f) { // Assuming C_least is positive
+                c_least_values.push_back(trace_c_least);
+                LOG_INF("Warmup trace %d C_least: %.6f\n", i + 1, trace_c_least);
+            } else {
+                LOG_WRN("Warmup trace %d failed or returned invalid C_least\n", i + 1);
+            }
+            
+            // Clear KV cache for next trace (except initial prompt)
+            llama_memory_seq_rm(mem, 0, initial_prompt_size, -1);
+            
+            // Reset the sampler state after clearing KV cache
+            common_sampler_reset(smpl);
+        }
+        
+        // Calculate dynamic threshold
+        if (!c_least_values.empty()) {
+            // Sort to find percentile
+            std::sort(c_least_values.begin(), c_least_values.end());
+            
+            // Calculate percentile index (eta from paper)
+            float percentile = sparams.deepconf_warmup_percentile / 100.0f;
+            size_t percentile_index = static_cast<size_t>(percentile * (c_least_values.size() - 1));
+            percentile_index = std::min(percentile_index, c_least_values.size() - 1);
+            
+            float dynamic_threshold = c_least_values[percentile_index];
+            LOG_INF("Calculated dynamic threshold from %zu warmup traces at %d%% percentile: %.6f\n",
+                    c_least_values.size(), sparams.deepconf_warmup_percentile, dynamic_threshold);
+            
+            // Apply the new threshold to the main sampler
+            common_sampler_deepconf_set_stopping_threshold(smpl, dynamic_threshold);
+            
+            // Return sampler to normal operation mode
+            common_sampler_deepconf_set_warmup_mode(smpl, deepconf_state::DEEPCONF_WARMUP_MODE_NONE);
+        } else {
+            LOG_ERR("All warmup traces failed. Disabling DeepConf.\n");
+            // Disable DeepConf if warmup failed
+        }
+    } else if (sparams.deepconf_warmup_enabled && params.interactive) {
+      LOG_INF("DeepConf warmup enabled but in interactive mode - skipping warmup\n");
+    }
+
     LOG_INF("generate: n_ctx = %d, n_batch = %d, n_predict = %d, n_keep = %d\n", n_ctx, params.n_batch, params.n_predict, params.n_keep);
 
     // group-attention state
@@ -517,6 +610,7 @@ int main(int argc, char ** argv) {
     bool input_echo           = true;
     bool display              = true;
     bool need_to_save_session = !path_session.empty() && n_matching_session_tokens < embd_inp.size();
+    bool stop_generation_due_to_consensus = false;
 
     int n_past             = 0;
     int n_remain           = params.n_predict;
@@ -562,7 +656,7 @@ int main(int argc, char ** argv) {
         embd_inp.push_back(decoder_start_token_id);
     }
 
-    while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
+    while (((n_remain != 0 && !is_antiprompt) || params.interactive) && !stop_generation_due_to_consensus) {
         // predict
         if (!embd.empty()) {
             // Note: (n_ctx - 4) here is to match the logic for commandline prompt handling via
@@ -702,6 +796,7 @@ int main(int argc, char ** argv) {
             const llama_token id = common_sampler_sample(smpl, ctx, -1);
 
             common_sampler_accept(smpl, id, /* accept_grammar= */ true);
+            common_sampler_deepconf_add_token_to_current_trace(smpl, id); // Add generated token to current trace
 
             // LOG_DBG("last: %s\n", string_from(ctx, smpl->prev.to_vector()).c_str());
 
@@ -714,6 +809,19 @@ int main(int argc, char ** argv) {
             --n_remain;
 
             LOG_DBG("n_remain: %d\n", n_remain);
+
+            // Check for trace completion and update consensus
+            bool trace_ended = (n_remain <= 0) || (id == llama_vocab_eos(vocab)) || common_sampler_deepconf_should_stop(smpl);
+            if (trace_ended && sparams.deepconf_ensemble_enabled) {
+                LOG_DBG("Trace ended. Checking for consensus.\n");
+                common_sampler_deepconf_add_answer_vote(smpl, ctx, common_sampler_deepconf_get_current_trace_tokens(smpl));
+                common_sampler_deepconf_calculate_consensus(smpl);
+                if (common_sampler_deepconf_check_consensus(smpl)) {
+                    LOG_INF("Consensus reached! Terminating generation.\n");
+                    stop_generation_due_to_consensus = true;
+                }
+                common_sampler_deepconf_clear_current_trace_tokens(smpl); // Clear for next trace
+            }
         } else {
             // some user input remains from prompt or interaction, forward it to processing
             LOG_DBG("embd_inp.size(): %d, n_consumed: %d\n", (int) embd_inp.size(), n_consumed);
@@ -990,3 +1098,4 @@ int main(int argc, char ** argv) {
 
     return 0;
 }
+

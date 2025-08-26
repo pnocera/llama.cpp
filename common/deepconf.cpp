@@ -11,7 +11,17 @@
 // DeepConf state implementation
 //
 
-deepconf_state::deepconf_state(const deepconf_params & p) : params(p), confidence_window(new ring_buffer<float>(p.window_size)), window_sum(0.0), should_stop(false), last_token_confidence(0.0f), last_group_confidence(0.0f), tokens_processed(0) {
+deepconf_state::deepconf_state(const deepconf_params & p) :
+    params(p),
+    confidence_window(new ring_buffer<float>(p.window_size)),
+    window_sum(0.0),
+    should_stop(false),
+    last_token_confidence(0.0f),
+    last_group_confidence(0.0f),
+    min_group_confidence(FLT_MAX),
+    warmup_mode(DEEPCONF_WARMUP_MODE_NONE),
+    tokens_processed(0),
+    consensus_reached(false) { // Initialize consensus_reached
 }
 
 deepconf_state::~deepconf_state() {
@@ -76,7 +86,77 @@ void deepconf_reset(deepconf_state * state) {
     state->should_stop = false;
     state->last_token_confidence = 0.0f;
     state->last_group_confidence = 0.0f;
+    state->min_group_confidence = FLT_MAX;                          // Reset C_least
+    state->warmup_mode = deepconf_state::DEEPCONF_WARMUP_MODE_NONE; // Reset warmup mode
     state->tokens_processed = 0;
+    state->answer_votes.clear();
+    state->consensus_reached    = false;
+    state->current_trace_tokens.clear();
+}
+
+void deepconf_add_token_to_current_trace(deepconf_state * state, llama_token token) {
+    if (!state) {
+        return;
+    }
+    state->current_trace_tokens.push_back(token);
+}
+
+void deepconf_clear_current_trace_tokens(deepconf_state * state) {
+    if (!state) {
+        return;
+    }
+    state->current_trace_tokens.clear();
+}
+
+const std::vector<llama_token> & deepconf_get_current_trace_tokens(const deepconf_state * state) {
+    static const std::vector<llama_token> empty; // Static empty vector to return if state is null
+    if (!state) {
+        return empty;
+    }
+    return state->current_trace_tokens;
+}
+
+void deepconf_add_answer_vote(deepconf_state * state, const std::vector<llama_token> & answer) {
+    if (!state || !state->params.ensemble_enabled) {
+        return;
+    }
+    state->answer_votes[answer]++;
+}
+
+void deepconf_calculate_consensus(deepconf_state * state) {
+    if (!state || !state->params.ensemble_enabled) {
+        return;
+    }
+
+    if (state->answer_votes.empty()) {
+        state->consensus_reached = false;
+        return;
+    }
+
+    int total_votes = 0;
+    int max_votes   = 0;
+
+    for (const auto & pair : state->answer_votes) {
+        total_votes += pair.second;
+        if (pair.second > max_votes) {
+            max_votes = pair.second;
+        }
+    }
+
+    if (total_votes == 0) {
+        state->consensus_reached = false;
+        return;
+    }
+
+    float beta = (float)max_votes / total_votes;
+    state->consensus_reached = (beta >= state->params.consensus_threshold);
+}
+
+bool deepconf_check_consensus(const deepconf_state * state) {
+    if (!state || !state->params.ensemble_enabled) {
+        return false;
+    }
+    return state->consensus_reached;
 }
 
 float deepconf_calculate_token_confidence(
@@ -166,11 +246,16 @@ bool deepconf_update(deepconf_state * state, float token_confidence) {
     } else {
         state->last_group_confidence = static_cast<float>(state->window_sum / static_cast<double>(count));
     }
+
+    // Update C_least if window is full
+    if (count >= state->params.window_size) {
+        state->min_group_confidence = std::min(state->min_group_confidence, state->last_group_confidence);
+    }
     
     // Check if we should stop based on confidence threshold
     // Log detailed information about the check
-    LOG_INF("DeepConf Update: window_fill=%zu/%zu, group_conf=%.6f, threshold=%.6f\n",
-               count, state->params.window_size, state->last_group_confidence, state->params.threshold);
+    LOG_INF("DeepConf Update: window_fill=%zu/%zu, group_conf=%.6f, min_group_conf=%.6f, threshold=%.6f\n",
+               count, state->params.window_size, state->last_group_confidence, state->min_group_confidence, state->params.threshold);
     bool should_continue = true;
     if (count >= state->params.window_size) {
         // Only check threshold once window is full
@@ -221,6 +306,11 @@ bool deepconf_should_stop(const deepconf_state * state) {
         return false;
     }
     
+    // If warmup is enabled and we are in collection mode, never stop
+    if (state->params.warmup_enabled && state->warmup_mode == deepconf_state::DEEPCONF_WARMUP_MODE_COLLECT) {
+        return false;
+    }
+    
     return state->should_stop;
 }
 
@@ -231,12 +321,34 @@ deepconf_stats deepconf_get_stats(const deepconf_state * state) {
         stats.tokens_processed = state->tokens_processed;
         stats.last_token_confidence = state->last_token_confidence;
         stats.last_group_confidence = state->last_group_confidence;
+        stats.min_group_confidence = state->min_group_confidence;
         stats.window_fill_level = state->confidence_window->size();
         stats.early_stop_triggered = state->should_stop;
         stats.params = state->params;
     }
     
     return stats;
+}
+
+void deepconf_set_warmup_mode(deepconf_state * state, deepconf_state::deepconf_warmup_mode mode) {
+    if (state) {
+        state->warmup_mode = mode;
+    }
+}
+
+// Get the minimum group confidence (C_least) observed so far in the current trace
+float deepconf_get_min_group_confidence(const deepconf_state * state) {
+    if (!state) {
+        return 0.0f;
+    }
+    return state->min_group_confidence;
+}
+
+// Set the dynamic stopping threshold for the DeepConf state
+void deepconf_set_stopping_threshold(deepconf_state * state, float threshold) {
+    if (state) {
+        state->params.threshold = threshold;
+    }
 }
 
 bool deepconf_validate_params(deepconf_params & params) {
@@ -295,6 +407,7 @@ void deepconf_print_state(const deepconf_state * state) {
     printf("  tokens_processed: %zu\n", state->tokens_processed);
     printf("  last_token_confidence: %.6f\n", state->last_token_confidence);
     printf("  last_group_confidence: %.6f\n", state->last_group_confidence);
+    printf("  min_group_confidence (C_least): %.6f\n", state->min_group_confidence);
     printf("  window_fill_level: %zu/%zu\n",
            state->confidence_window->size(),
            state->params.window_size);

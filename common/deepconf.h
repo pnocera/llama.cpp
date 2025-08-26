@@ -3,9 +3,11 @@
 #include "llama.h"
 
 #include <vector>
+#include <map> // Added for std::map
 #include <cmath>
 #include <string>
 #include <stdexcept>
+#include <cfloat> // For FLT_MAX
 
 // TODO: deduplicate with llama-impl.h (this comment remains for future refactoring)
 template<typename T>
@@ -125,6 +127,15 @@ struct deepconf_params {
     // Number of runners-up (k) used for token confidence (1-40).
     // This excludes the sampled (winning) token.
     int    top_k        = 4;
+
+    // Offline Warmup parameters
+    bool   warmup_enabled = false; // Enable Offline Warmup for dynamic threshold
+    int    warmup_traces = 16;     // N_init: Number of traces to run for warmup
+    int    warmup_percentile = 90; // eta: Percentile for dynamic threshold (e.g., 90 for aggressive)
+
+    // Ensemble Consensus Stop parameters
+    bool   ensemble_enabled = false;    // Enable Ensemble Consensus Stop
+    float  consensus_threshold = 0.95f; // tau: Consensus threshold (e.g., 0.95)
 };
 
 struct deepconf_state {
@@ -134,7 +145,18 @@ struct deepconf_state {
     bool should_stop;                       // Flag indicating early stopping should occur
     float last_token_confidence;            // Confidence of the most recent token
     float last_group_confidence;            // Most recent group confidence value
+    float min_group_confidence;             // Lowest Group Confidence (C_least) observed in current trace
+    enum deepconf_warmup_mode {
+        DEEPCONF_WARMUP_MODE_NONE,
+        DEEPCONF_WARMUP_MODE_COLLECT,       // Collecting C_least values
+        DEEPCONF_WARMUP_MODE_APPLY,         // Applying dynamic threshold
+    } warmup_mode;                          // Current warmup mode (for Offline Warmup)
     size_t tokens_processed;                // Total tokens processed (for debugging)
+
+    // Ensemble Consensus Stop
+    std::map<std::vector<llama_token>, int> answer_votes; // Map of answers (token sequences) to vote counts
+    bool consensus_reached;                               // Flag indicating if consensus has been reached
+    std::vector<llama_token> current_trace_tokens;        // Tokens generated in the current trace
 
     deepconf_state(const deepconf_params & params);
     ~deepconf_state();
@@ -186,11 +208,29 @@ float deepconf_get_group_confidence(const deepconf_state * state);
 // Check if early stopping should occur based on current state
 bool deepconf_should_stop(const deepconf_state * state);
 
+// Get the minimum group confidence (C_least) observed so far in the current trace
+float deepconf_get_min_group_confidence(const deepconf_state * state);
+
+// Set the dynamic stopping threshold for the DeepConf state
+void deepconf_set_stopping_threshold(deepconf_state * state, float threshold);
+
+// Set the warmup mode for the DeepConf state
+void deepconf_set_warmup_mode(deepconf_state * state, deepconf_state::deepconf_warmup_mode mode);
+
+// Ensemble Consensus Stop functions
+void deepconf_add_token_to_current_trace(deepconf_state * state, llama_token token);
+void deepconf_clear_current_trace_tokens(deepconf_state * state);
+const std::vector<llama_token> & deepconf_get_current_trace_tokens(const deepconf_state * state);
+void deepconf_add_answer_vote(deepconf_state * state, const std::vector<llama_token> & answer);
+void deepconf_calculate_consensus(deepconf_state * state);
+bool deepconf_check_consensus(const deepconf_state * state);
+
 // Get statistics for debugging/monitoring
 struct deepconf_stats {
     size_t tokens_processed;
     float  last_token_confidence;
     float  last_group_confidence;
+    float  min_group_confidence;    // Lowest Group Confidence (C_least) observed in current trace
     size_t window_fill_level;       // How many slots in window are filled
     bool   early_stop_triggered;
     deepconf_params params;

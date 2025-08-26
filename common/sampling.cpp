@@ -200,12 +200,16 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, co
 
     // Initialize DeepConf state if enabled
     if (params.deepconf_enabled) {
-        // Initialize DeepConf state if enabled
         deepconf_params deepconf_p;
         deepconf_p.enabled = params.deepconf_enabled;
         deepconf_p.window_size = (size_t)params.deepconf_window_size;
         deepconf_p.threshold = params.deepconf_threshold;
         deepconf_p.top_k = (size_t)params.deepconf_top_k;
+        deepconf_p.warmup_enabled = params.deepconf_warmup_enabled;
+        deepconf_p.warmup_traces = params.deepconf_warmup_traces;
+        deepconf_p.warmup_percentile = params.deepconf_warmup_percentile;
+        deepconf_p.ensemble_enabled = params.deepconf_ensemble_enabled;
+        deepconf_p.consensus_threshold = params.deepconf_consensus_threshold;
         result->deepconf = deepconf_init(deepconf_p);
         
         if (!result->deepconf) {
@@ -338,6 +342,66 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     }
 
     return cur_p.data[cur_p.selected].id;
+}
+
+float common_sampler_sample_with_confidence(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool is_group, bool grammar_first) {
+    gsmpl->set_logits(ctx, idx);
+
+    auto & grmr  = gsmpl->grmr;
+    auto & chain = gsmpl->chain;
+    auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+
+    if (grammar_first) {
+        llama_sampler_apply(grmr, &cur_p);
+    }
+
+    llama_sampler_apply(chain, &cur_p);
+
+    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
+
+    const llama_token id = cur_p.data[cur_p.selected].id;
+
+    if (grammar_first) {
+        if (gsmpl->deepconf) {
+            deepconf_process_token(gsmpl->deepconf, &cur_p, id);
+            return deepconf_get_group_confidence(gsmpl->deepconf);
+        }
+        return 0.0f; // Should not happen if DeepConf is enabled
+    }
+
+    // check if it the sampled token fits the grammar
+    {
+        llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
+        llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
+
+        llama_sampler_apply(grmr, &single_token_data_array);
+
+        const bool is_valid = single_token_data_array.data[0].logit != -INFINITY;
+        if (is_valid) {
+            // Update DeepConf confidence tracking
+            if (gsmpl->deepconf) {
+                deepconf_process_token(gsmpl->deepconf, &cur_p, id);
+                return deepconf_get_group_confidence(gsmpl->deepconf);
+            }
+            return 0.0f; // Should not happen if DeepConf is enabled
+        }
+    }
+
+    // resampling:
+    // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
+    gsmpl->set_logits(ctx, idx);
+
+    llama_sampler_apply(grmr,  &cur_p);
+    llama_sampler_apply(chain, &cur_p);
+
+    GGML_ASSERT(cur_p.selected != -1 && "no selected token during re-sampling - check your sampling configuration");
+
+    // Update DeepConf confidence tracking
+    if (gsmpl->deepconf) {
+        deepconf_process_token(gsmpl->deepconf, &cur_p, cur_p.data[cur_p.selected].id);
+        return deepconf_get_group_confidence(gsmpl->deepconf);
+    }
+    return 0.0f; // Should not happen if DeepConf is enabled
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
@@ -553,6 +617,70 @@ float common_sampler_get_confidence(const struct common_sampler * gsmpl) {
     return deepconf_get_group_confidence(gsmpl->deepconf);
 }
 
+void common_sampler_deepconf_reset(struct common_sampler * gsmpl) {
+    if (gsmpl && gsmpl->deepconf) {
+        deepconf_reset(gsmpl->deepconf);
+    }
+}
+
+void common_sampler_deepconf_set_warmup_mode(struct common_sampler * gsmpl, enum deepconf_state::deepconf_warmup_mode mode) {
+    if (gsmpl && gsmpl->deepconf) {
+        deepconf_set_warmup_mode(gsmpl->deepconf, mode);
+    }
+}
+
+float common_sampler_deepconf_get_min_group_confidence(const struct common_sampler * gsmpl) {
+    if (!gsmpl || !gsmpl->deepconf) {
+        return 0.0f; // Or some other appropriate default/error value
+    }
+    return deepconf_get_min_group_confidence(gsmpl->deepconf);
+}
+
+void common_sampler_deepconf_set_stopping_threshold(struct common_sampler * gsmpl, float threshold) {
+    if (gsmpl && gsmpl->deepconf) {
+        deepconf_set_stopping_threshold(gsmpl->deepconf, threshold);
+    }
+}
+
+void common_sampler_deepconf_add_token_to_current_trace(struct common_sampler * gsmpl, llama_token token) {
+    if (gsmpl && gsmpl->deepconf) {
+        deepconf_add_token_to_current_trace(gsmpl->deepconf, token);
+    }
+}
+
+void common_sampler_deepconf_clear_current_trace_tokens(struct common_sampler * gsmpl) {
+    if (gsmpl && gsmpl->deepconf) {
+        deepconf_clear_current_trace_tokens(gsmpl->deepconf);
+    }
+}
+
+const std::vector<llama_token> & common_sampler_deepconf_get_current_trace_tokens(const struct common_sampler * gsmpl) {
+    if (!gsmpl || !gsmpl->deepconf) {
+        static const std::vector<llama_token> empty;
+        return empty;
+    }
+    return deepconf_get_current_trace_tokens(gsmpl->deepconf);
+}
+
+void common_sampler_deepconf_add_answer_vote(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<llama_token> & answer) {
+    if (gsmpl && gsmpl->deepconf) {
+        deepconf_add_answer_vote(gsmpl->deepconf, answer);
+    }
+}
+
+void common_sampler_deepconf_calculate_consensus(struct common_sampler * gsmpl) {
+    if (gsmpl && gsmpl->deepconf) {
+        deepconf_calculate_consensus(gsmpl->deepconf);
+    }
+}
+
+bool common_sampler_deepconf_check_consensus(const struct common_sampler * gsmpl) {
+    if (gsmpl && gsmpl->deepconf) {
+        return deepconf_check_consensus(gsmpl->deepconf);
+    }
+    return false;
+}
+
 std::string common_sampler_deepconf_stats(const struct common_sampler * gsmpl) {
     if (!gsmpl || !gsmpl->deepconf) {
         return "DeepConf: disabled";
@@ -568,6 +696,7 @@ std::string common_sampler_deepconf_stats(const struct common_sampler * gsmpl) {
         << ", tokens_processed=" << stats.tokens_processed
         << ", last_token_conf=" << stats.last_token_confidence
         << ", group_conf=" << stats.last_group_confidence
+        << ", min_group_conf=" << stats.min_group_confidence
         << ", should_stop=" << (stats.early_stop_triggered ? "true" : "false");
     
     return oss.str();

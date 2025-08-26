@@ -191,6 +191,16 @@ struct common_params_sampling {
     float   deepconf_threshold    = 0.8f;  // confidence threshold for early stopping (0.1-100.0)
     int32_t deepconf_top_k        = 4;     // number of runner-up tokens for confidence calculation (1-40)
 
+    // DeepConf: Offline Warmup parameters
+    bool    deepconf_warmup_enabled      = false; // enable DeepConf Offline Warmup for dynamic threshold
+    int32_t deepconf_warmup_traces       = 16;    // number of traces to run for warmup
+    int32_t deepconf_warmup_percentile   = 90;    // percentile for dynamic threshold (0-100)
+
+    // DeepConf: Ensemble Consensus parameters
+    bool    deepconf_ensemble_enabled    = false;   // enable DeepConf Ensemble Consensus Stop
+    float   deepconf_consensus_threshold = 0.95f;   // consensus threshold for early stopping (0.0-1.0)
+    bool    deepconf_consensus_stop_signaled = false; // signal to stop all traces due to consensus
+
     // print the parameters into a string
     std::string print() const;
 };
