@@ -184,6 +184,10 @@ struct slot_params {
             {"mirostat",                  sampling.mirostat},
             {"mirostat_tau",              sampling.mirostat_tau},
             {"mirostat_eta",              sampling.mirostat_eta},
+            {"deepconf_enabled",          sampling.deepconf_enabled},
+            {"deepconf_window_size",      sampling.deepconf_window_size},
+            {"deepconf_threshold",        sampling.deepconf_threshold},
+            {"deepconf_top_k",            sampling.deepconf_top_k},
             {"stop",                      antiprompt},
             {"max_tokens",                n_predict}, // User configured n_predict
             {"n_keep",                    n_keep},
@@ -298,6 +302,12 @@ struct server_task {
         params.sampling.n_probs            = json_value(data, "n_probs",            defaults.sampling.n_probs);
         params.sampling.min_keep           = json_value(data, "min_keep",           defaults.sampling.min_keep);
         params.post_sampling_probs         = json_value(data, "post_sampling_probs", defaults.post_sampling_probs);
+
+        // DeepConf parameters
+        params.sampling.deepconf_enabled      = json_value(data, "deepconf_enabled",      defaults.sampling.deepconf_enabled);
+        params.sampling.deepconf_window_size  = json_value(data, "deepconf_window_size",  defaults.sampling.deepconf_window_size);
+        params.sampling.deepconf_threshold    = json_value(data, "deepconf_threshold",    defaults.sampling.deepconf_threshold);
+        params.sampling.deepconf_top_k        = json_value(data, "deepconf_top_k",        defaults.sampling.deepconf_top_k);
 
         params.speculative.n_min = json_value(data, "speculative.n_min", defaults.speculative.n_min);
         params.speculative.n_max = json_value(data, "speculative.n_max", defaults.speculative.n_max);
