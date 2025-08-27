@@ -21,7 +21,9 @@ deepconf_state::deepconf_state(const deepconf_params & p) :
     min_group_confidence(FLT_MAX),
     warmup_mode(DEEPCONF_WARMUP_MODE_NONE),
     tokens_processed(0),
-    consensus_reached(false) { // Initialize consensus_reached
+    consensus_reached(false), // Initialize consensus_reached
+    current_trace_confidences(), // Initialize current_trace_confidences
+    warmup_c_least_scores() { // Initialize warmup_c_least_scores
 }
 
 deepconf_state::~deepconf_state() {
@@ -92,6 +94,8 @@ void deepconf_reset(deepconf_state * state) {
     state->answer_votes.clear();
     state->consensus_reached    = false;
     state->current_trace_tokens.clear();
+    state->current_trace_confidences.clear();
+    state->warmup_c_least_scores.clear(); // Clear warmup scores on reset
 }
 
 void deepconf_add_token_to_current_trace(deepconf_state * state, llama_token token) {
@@ -260,6 +264,7 @@ bool deepconf_update(deepconf_state * state, float token_confidence) {
     // Update state
     state->last_token_confidence = token_confidence;
     state->tokens_processed++;
+    state->current_trace_confidences.push_back(token_confidence); // Store confidence for C_tail and C_bottom-N
     
     // Maintain O(1) rolling sum and sliding window
     if (state->confidence_window->size() == state->params.window_size) {
@@ -304,7 +309,62 @@ bool deepconf_update(deepconf_state * state, float token_confidence) {
         LOG_INF("DeepConf Update: Window not full yet, not checking threshold\n");
     }
     
+    // Handle warmup mode transitions
+    if (state->params.warmup_enabled && state->warmup_mode == deepconf_state::DEEPCONF_WARMUP_MODE_COLLECT) {
+        // Check if we've collected enough traces
+        if ((int)state->warmup_c_least_scores.size() >= state->params.warmup_traces) {
+            LOG_INF("DeepConf: Collected enough warmup traces (%zu), setting adaptive threshold\n",
+                    state->warmup_c_least_scores.size());
+            // Calculate and set adaptive threshold
+            deepconf_set_adaptive_threshold(state, state->params.warmup_percentile);
+            // Transition to APPLY mode
+            deepconf_set_warmup_mode(state, deepconf_state::DEEPCONF_WARMUP_MODE_APPLY);
+            // Reset state for real generation
+            deepconf_reset(state);
+        }
+    }
+    
     return should_continue;
+}
+
+// Function to be called when a trace is finished to collect C_least score during warmup
+void deepconf_end_trace(deepconf_state * state) {
+    if (!state || !state->params.warmup_enabled) {
+        return;
+    }
+    
+    // If we're in collection mode, collect the C_least score for this trace
+    if (state->warmup_mode == deepconf_state::DEEPCONF_WARMUP_MODE_COLLECT) {
+        // Store the minimum group confidence (C_least) for this trace
+        state->warmup_c_least_scores.push_back(state->min_group_confidence);
+        LOG_INF("DeepConf: Collected C_least score %.6f for trace %zu\n",
+                state->min_group_confidence, state->warmup_c_least_scores.size());
+        
+        // Check if we've collected enough traces
+        if ((int)state->warmup_c_least_scores.size() >= state->params.warmup_traces) {
+            LOG_INF("DeepConf: Collected enough warmup traces (%zu), setting adaptive threshold\n",
+                    state->warmup_c_least_scores.size());
+            
+            // Temporarily replace the confidence window with our collected scores for percentile calculation
+            ring_buffer<float> * original_window = state->confidence_window;
+            state->confidence_window = new ring_buffer<float>(state->warmup_c_least_scores.size());
+            
+            // Fill the window with our collected scores
+            for (float score : state->warmup_c_least_scores) {
+                state->confidence_window->push_back(score);
+            }
+            
+            // Calculate and set adaptive threshold
+            deepconf_set_adaptive_threshold(state, state->params.warmup_percentile);
+            
+            // Restore original window
+            delete state->confidence_window;
+            state->confidence_window = original_window;
+            
+            // Transition to APPLY mode
+            deepconf_set_warmup_mode(state, deepconf_state::DEEPCONF_WARMUP_MODE_APPLY);
+        }
+    }
 }
 
 bool deepconf_process_token(
@@ -395,28 +455,36 @@ void deepconf_set_stopping_threshold(deepconf_state * state, float threshold) {
 // state: DeepConf state with collected warmup scores
 // percentile: Desired percentile (e.g., 90 for aggressive "DeepConf-low", 10 for conservative "DeepConf-high")
 void deepconf_set_adaptive_threshold(deepconf_state * state, int percentile) {
-    if (!state || !state->params.warmup_enabled) {
+    if (!state) {
         return;
     }
     
-    // Convert ring_buffer to vector for percentile calculation
-    std::vector<float> warmup_scores = state->confidence_window->to_vector();
+    // Use the warmup_c_least_scores if we're in warmup mode, otherwise use the confidence window
+    std::vector<float> scores;
+    if (state->params.warmup_enabled &&
+        (state->warmup_mode == deepconf_state::DEEPCONF_WARMUP_MODE_COLLECT ||
+         state->warmup_mode == deepconf_state::DEEPCONF_WARMUP_MODE_APPLY)) {
+        // Use collected C_least scores during warmup
+        scores = state->warmup_c_least_scores;
+    } else {
+        // Convert ring_buffer to vector for percentile calculation
+        scores = state->confidence_window->to_vector();
+    }
     
-    // Check if we have enough scores
-    if (warmup_scores.size() < (size_t)state->params.warmup_traces) {
-        LOG_WRN("Not enough warmup scores collected (%zu < %d), using default threshold\n",
-                warmup_scores.size(), state->params.warmup_traces);
+    // Check if we have any scores
+    if (scores.empty()) {
+        LOG_WRN("No scores available for adaptive threshold calculation\n");
         return;
     }
     
     // Calculate the percentile-based threshold
-    float adaptive_threshold = deepconf_calculate_percentile(warmup_scores, percentile);
+    float adaptive_threshold = deepconf_calculate_percentile(scores, percentile);
     
     // Set the calculated threshold
     deepconf_set_stopping_threshold(state, adaptive_threshold);
     
-    LOG_INF("Set adaptive threshold to %.6f based on %d percentile of %zu warmup scores\n",
-            adaptive_threshold, percentile, warmup_scores.size());
+    LOG_INF("Set adaptive threshold to %.6f based on %d percentile of %zu scores\n",
+            adaptive_threshold, percentile, scores.size());
 }
 
 bool deepconf_validate_params(deepconf_params & params) {
@@ -458,7 +526,46 @@ deepconf_params deepconf_default_params() {
     params.window_size = 8;
     params.threshold = 0.8f;
     params.top_k = 4;
+    params.tail_size = 5; // Default for C_tail
+    params.bottom_n = 10; // Default for C_bottom-N
     return params;
+}
+
+float deepconf_calculate_c_tail(const deepconf_state * state) {
+    if (!state || state->current_trace_confidences.empty() || state->params.tail_size == 0) {
+        return 0.0f;
+    }
+
+    size_t start_index = 0;
+    if (state->current_trace_confidences.size() > state->params.tail_size) {
+        start_index = state->current_trace_confidences.size() - state->params.tail_size;
+    }
+
+    double sum_conf = 0.0;
+    for (size_t i = start_index; i < state->current_trace_confidences.size(); ++i) {
+        sum_conf += state->current_trace_confidences[i];
+    }
+
+    return static_cast<float>(sum_conf / (state->current_trace_confidences.size() - start_index));
+}
+
+float deepconf_calculate_c_bottom_n(const deepconf_state * state) {
+    if (!state || state->current_trace_confidences.empty() || state->params.bottom_n == 0) {
+        return 0.0f;
+    }
+    
+    // Sort confidences to find the bottom N
+    std::vector<float> sorted_confidences = state->current_trace_confidences;
+    std::sort(sorted_confidences.begin(), sorted_confidences.end());
+    
+    size_t n = std::min(state->params.bottom_n, sorted_confidences.size());
+    
+    double sum_conf = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        sum_conf += sorted_confidences[i];
+    }
+    
+    return static_cast<float>(sum_conf / n);
 }
 
 void deepconf_print_state(const deepconf_state * state) {
@@ -481,7 +588,43 @@ void deepconf_print_state(const deepconf_state * state) {
            state->params.window_size);
     printf("  should_stop: %s\n", state->should_stop ? "true" : "false");
 }
-
+// Perform confidence-weighted majority voting
+// trace_answers: Vector of answer token sequences from different traces
+// trace_confidences: Vector of confidence scores for each trace
+// Returns: The voted answer token sequence
+std::vector<llama_token> deepconf_weighted_majority_voting(
+    const std::vector<std::vector<llama_token>> & trace_answers,
+    const std::vector<float> & trace_confidences) {
+        
+    if (trace_answers.empty() || trace_answers.size() != trace_confidences.size()) {
+        return {}; // Return empty vector if inputs are inconsistent
+    }
+        
+    // Map to store cumulative confidence weights for each unique answer
+    std::map<std::vector<llama_token>, double> answer_weights;
+        
+    // Accumulate confidence weights for each answer
+    for (size_t i = 0; i < trace_answers.size(); ++i) {
+        const auto & answer = trace_answers[i];
+        double confidence = static_cast<double>(trace_confidences[i]);
+        
+        // Add confidence to this answer's cumulative weight
+        answer_weights[answer] += confidence;
+    }
+        
+    // Find the answer with the highest cumulative confidence weight
+    std::vector<llama_token> best_answer;
+    double max_weight = -1.0;
+    
+    for (const auto & pair : answer_weights) {
+        if (pair.second > max_weight) {
+            max_weight = pair.second;
+            best_answer = pair.first;
+        }
+    }
+    
+    return best_answer;
+}
 std::string deepconf_params_to_string(const deepconf_params & params) {
     std::ostringstream oss;
     oss << "deepconf_enabled = " << (params.enabled ? "true" : "false")
@@ -489,4 +632,60 @@ std::string deepconf_params_to_string(const deepconf_params & params) {
         << ", deepconf_threshold = " << params.threshold
         << ", deepconf_top_k = " << params.top_k;
     return oss.str();
+}
+
+// Filter traces based on confidence percentiles
+// Returns indices of traces to keep (top gamma_filter_percent% of traces)
+std::vector<size_t> deepconf_filter_traces_by_confidence(
+    const std::vector<float> & trace_confidences,
+    float gamma_filter_percent) {
+    
+    if (trace_confidences.empty()) {
+        return {};
+    }
+    
+    // Clamp gamma_filter_percent to valid range [0.0, 100.0]
+    gamma_filter_percent = std::max(0.0f, std::min(100.0f, gamma_filter_percent));
+    
+    // If gamma_filter_percent is 100.0, keep all traces
+    if (gamma_filter_percent >= 100.0f) {
+        std::vector<size_t> all_indices(trace_confidences.size());
+        for (size_t i = 0; i < trace_confidences.size(); ++i) {
+            all_indices[i] = i;
+        }
+        return all_indices;
+    }
+    
+    // Create vector of (confidence, index) pairs
+    std::vector<std::pair<float, size_t>> conf_index_pairs;
+    conf_index_pairs.reserve(trace_confidences.size());
+    
+    for (size_t i = 0; i < trace_confidences.size(); ++i) {
+        conf_index_pairs.emplace_back(trace_confidences[i], i);
+    }
+    
+    // Sort by confidence in descending order (highest confidence first)
+    std::sort(conf_index_pairs.begin(), conf_index_pairs.end(),
+              [](const auto & a, const auto & b) { return a.first > b.first; });
+    
+    // Calculate number of traces to keep
+    size_t keep_count = static_cast<size_t>(
+        std::ceil(trace_confidences.size() * gamma_filter_percent / 100.0f)
+    );
+    
+    // Ensure we keep at least one trace
+    keep_count = std::max(static_cast<size_t>(1), std::min(keep_count, trace_confidences.size()));
+    
+    // Extract indices of top traces
+    std::vector<size_t> filtered_indices;
+    filtered_indices.reserve(keep_count);
+    
+    for (size_t i = 0; i < keep_count; ++i) {
+        filtered_indices.push_back(conf_index_pairs[i].second);
+    }
+    
+    // Sort indices to maintain original order
+    std::sort(filtered_indices.begin(), filtered_indices.end());
+    
+    return filtered_indices;
 }

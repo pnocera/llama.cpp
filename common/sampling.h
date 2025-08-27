@@ -127,6 +127,13 @@ bool common_sampler_deepconf_check_consensus(const struct common_sampler * gsmpl
 // extended sampling implementation that returns confidence
 float common_sampler_sample_with_confidence(struct common_sampler * gsmpl, struct llama_context * ctx, llama_token_data_array * candidates, int32_t * token_id);
 
+// DeepConf: Apply offline filtering and weighted majority voting to a set of traces
+std::vector<llama_token> common_sampler_deepconf_apply_offline_post_processing(
+    struct common_sampler * gsmpl,
+    const std::vector<std::vector<llama_token>> & all_traces,
+    const std::vector<float> & all_trace_confidences,
+    float gamma_filter_percent);
+
 // get DeepConf statistics for debugging
 std::string common_sampler_deepconf_stats(const struct common_sampler * gsmpl);
 std::string common_sampler_type_to_str(enum common_sampler_type cnstr);

@@ -568,7 +568,165 @@ int main(int argc, char ** argv) {
         LOG_INF("DeepConf warmup enabled but in interactive mode - skipping warmup\n");
     }
 
+    // Define a structure to hold the results of a single generation trace
+    struct trace_result {
+        std::string text;
+        float c_least;
+        int text_length_tokens;
+        
+        // For sorting: higher C_least is better
+        bool operator<(const trace_result& other) const {
+            return c_least < other.c_least;
+        }
+    };
+
+    // Helper function to run a single generation trace for offline filtering/voting
+    // Returns the generated text and C_least for the trace
+    auto run_single_trace = [&](const std::vector<llama_token>& prompt_tokens) -> trace_result {
+        LOG_DBG("Running single generation trace\n");
+        trace_result result = {};
+        
+        // Reset sampler's DeepConf state for this trace
+        common_sampler_deepconf_reset(smpl);
+        common_sampler_deepconf_clear_current_trace_tokens(smpl);
+        common_sampler_deepconf_set_warmup_mode(smpl, deepconf_state::DEEPCONF_WARMUP_MODE_NONE);
+        
+        // Clear KV cache for this trace, keeping the initial prompt
+        llama_memory_seq_rm(mem, 0, prompt_tokens.size(), -1);
+        
+        // Reset the sampler state after clearing KV cache
+        common_sampler_reset(smpl);
+        
+        // Re-evaluate the initial prompt for this trace
+        int n_past = 0;
+        // Evaluate prompt in batches
+        for (int i = 0; i < (int) prompt_tokens.size(); i += params.n_batch) {
+            int n_eval = (int) prompt_tokens.size() - i;
+            if (n_eval > params.n_batch) {
+                n_eval = params.n_batch;
+            }
+            // Create a temporary mutable vector for the batch
+            std::vector<llama_token> batch_tokens(prompt_tokens.begin() + i, prompt_tokens.begin() + i + n_eval);
+
+            if (llama_decode(ctx, llama_batch_get_one(batch_tokens.data(), n_eval))) {
+                LOG_ERR("%s : failed to eval prompt for trace\n", __func__);
+                return result; // Return empty result on error
+            }
+            n_past += n_eval;
+        }
+
+        int n_remain = params.n_predict;
+        std::ostringstream trace_output_ss;
+        std::vector<llama_token> trace_output_tokens;
+
+        // Single trace generation loop
+        while (n_remain > 0) {
+            const llama_token id = common_sampler_sample(smpl, ctx, -1);
+            common_sampler_accept(smpl, id, true);
+            common_sampler_deepconf_add_token_to_current_trace(smpl, id);
+
+            // Append token to output
+            const std::string token_str = common_token_to_piece(ctx, id, params.special);
+            trace_output_ss << token_str;
+            trace_output_tokens.push_back(id);
+
+            --n_remain;
+
+            // Check for stopping conditions for this trace
+            if (id == llama_vocab_eos(vocab) || common_sampler_deepconf_should_stop(smpl)) {
+                LOG_DBG("Single trace stopped early. n_remain: %d, eos: %d, deepconf_stop: %d\n",
+                            n_remain, id == llama_vocab_eos(vocab), common_sampler_deepconf_should_stop(smpl));
+                break;
+            }
+
+            // Evaluate the new token
+            llama_token current_token_id = id; // Create a mutable copy
+            if (llama_decode(ctx, llama_batch_get_one(&current_token_id, 1))) {
+                 LOG_ERR("%s : failed to eval token for trace\n", __func__);
+                 break;
+            }
+            n_past += 1;
+
+            // Prevent exceeding context
+            if (n_past >= n_ctx) {
+                LOG_DBG("Context window filled during single trace.\n");
+                break;
+            }
+        }
+        
+        result.text = trace_output_ss.str();
+        result.c_least = common_sampler_deepconf_get_min_group_confidence(smpl);
+        result.text_length_tokens = trace_output_tokens.size();
+        
+        LOG_DBG("Single trace completed. C_least: %.6f, tokens: %d\n", result.c_least, result.text_length_tokens);
+        
+        return result;
+    };
+
+    bool stop_generation_due_to_consensus = false; // Declared here for DeepConf multi-trace logic
     LOG_INF("generate: n_ctx = %d, n_batch = %d, n_predict = %d, n_keep = %d\n", n_ctx, params.n_batch, params.n_predict, params.n_keep);
+
+    // DeepConf: Offline Filtering and Voting
+    if (sparams.deepconf_n_gen_traces > 1 && !params.interactive) {
+        LOG_INF("Starting DeepConf Offline Filtering and Voting with %d traces\n", sparams.deepconf_n_gen_traces);
+        std::vector<trace_result> all_trace_results;
+        all_trace_results.reserve(sparams.deepconf_n_gen_traces);
+
+        for (int i = 0; i < sparams.deepconf_n_gen_traces; ++i) {
+            LOG_INF("Running generation trace %d/%d\n", i + 1, sparams.deepconf_n_gen_traces);
+            trace_result current_trace_result = run_single_trace(embd_inp);
+            if (!current_trace_result.text.empty()) {
+                all_trace_results.push_back(current_trace_result);
+            } else {
+                LOG_WRN("Trace %d/%d generated empty text or failed.\n", i + 1, sparams.deepconf_n_gen_traces);
+            }
+        }
+
+        if (!all_trace_results.empty()) {
+            // Sort traces by C_least in ascending order for filtering (operator< defined in trace_result)
+            std::sort(all_trace_results.begin(), all_trace_results.end());
+
+            // Offline Filtering: Discard bottom gamma% of responses
+            // Gamma filtering percentage is configurable via CLI.
+            const float gamma_percent = sparams.deepconf_gamma_filter_percent / 100.0f;
+            size_t num_to_discard = static_cast<size_t>(gamma_percent * all_trace_results.size());
+            
+            if (num_to_discard >= all_trace_results.size()) {
+                // Ensure we don't discard all traces if there are very few
+                num_to_discard = all_trace_results.size() > 1 ? all_trace_results.size() - 1 : 0;
+            }
+
+            LOG_INF("Discarding %zu (%.1f%%) traces with lowest C_least values.\n", num_to_discard, gamma_percent * 100);
+            all_trace_results.erase(all_trace_results.begin(), all_trace_results.begin() + num_to_discard);
+
+            // Weighted Voting: Select the best trace from the remaining ones
+            // Criteria: highest C_least, then longest text if C_least is tied.
+            if (!all_trace_results.empty()) {
+                std::sort(all_trace_results.begin(), all_trace_results.end(), [](const trace_result& a, const trace_result& b) {
+                    if (a.c_least != b.c_least) {
+                        return a.c_least > b.c_least; // Highest C_least first
+                    }
+                    return a.text_length_tokens > b.text_length_tokens; // Longest text if C_least is tied
+                });
+
+                const trace_result& final_result = all_trace_results.front();
+                LOG_INF("DeepConf Offline: Selected final answer (C_least: %.6f, tokens: %d):\n%s\n",
+                        final_result.c_least, final_result.text_length_tokens, final_result.text.c_str());
+                
+                // Output the final selected text to the console
+                console::set_display(console::reset);
+                LOG("%s", final_result.text.c_str());
+                LOG("\n"); // Add a newline for clean output
+                
+                // Signal to stop the main generation loop as we have our final answer
+                stop_generation_due_to_consensus = true; // Re-use existing flag
+            } else {
+                LOG_ERR("All traces were discarded or failed. No final answer selected.\n");
+            }
+        } else {
+            LOG_ERR("No successful traces were generated for offline filtering/voting.\n");
+        }
+    }
 
     // group-attention state
     // number of grouped KV tokens so far (used only if params.grp_attn_n > 1)
@@ -613,7 +771,6 @@ int main(int argc, char ** argv) {
     bool input_echo           = true;
     bool display              = true;
     bool need_to_save_session = !path_session.empty() && n_matching_session_tokens < embd_inp.size();
-    bool stop_generation_due_to_consensus = false;
 
     int n_past             = 0;
     int n_remain           = params.n_predict;
@@ -800,6 +957,11 @@ int main(int argc, char ** argv) {
 
             common_sampler_accept(smpl, id, /* accept_grammar= */ true);
             common_sampler_deepconf_add_token_to_current_trace(smpl, id); // Add generated token to current trace
+
+            if (common_sampler_deepconf_should_stop(smpl)) {
+                LOG_INF("DeepConf: Online stopping triggered.\n");
+                stop_generation_due_to_consensus = true; // Use this flag to stop the main loop
+            }
 
             // LOG_DBG("last: %s\n", string_from(ctx, smpl->prev.to_vector()).c_str());
 

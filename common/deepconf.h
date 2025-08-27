@@ -136,6 +136,10 @@ struct deepconf_params {
     // Ensemble Consensus Stop parameters
     bool   ensemble_enabled = false;    // Enable Ensemble Consensus Stop
     float  consensus_threshold = 0.95f; // tau: Consensus threshold (e.g., 0.95)
+    
+    // Additional parameters for C_tail and C_bottom-N calculations
+    size_t tail_size = 5; // Number of tokens at the end of a trace for C_tail
+    size_t bottom_n = 10; // Number of lowest confidence tokens for C_bottom-N
 };
 
 struct deepconf_state {
@@ -157,6 +161,8 @@ struct deepconf_state {
     std::map<std::vector<llama_token>, int> answer_votes; // Map of answers (token sequences) to vote counts
     bool consensus_reached;                               // Flag indicating if consensus has been reached
     std::vector<llama_token> current_trace_tokens;        // Tokens generated in the current trace
+    std::vector<float> current_trace_confidences;         // Confidence values for tokens in the current trace
+    std::vector<float> warmup_c_least_scores;             // Collected C_least scores during warmup
 
     deepconf_state(const deepconf_params & params);
     ~deepconf_state();
@@ -211,6 +217,12 @@ bool deepconf_should_stop(const deepconf_state * state);
 // Get the minimum group confidence (C_least) observed so far in the current trace
 float deepconf_get_min_group_confidence(const deepconf_state * state);
 
+// Calculate C_tail (average confidence of last tail_size tokens)
+float deepconf_calculate_c_tail(const deepconf_state * state);
+
+// Calculate C_bottom-n (average confidence of the n lowest confidence tokens)
+float deepconf_calculate_c_bottom_n(const deepconf_state * state);
+
 // Set the dynamic stopping threshold for the DeepConf state
 void deepconf_set_stopping_threshold(deepconf_state * state, float threshold);
 
@@ -225,6 +237,9 @@ void deepconf_set_adaptive_threshold(deepconf_state * state, int percentile);
 
 // Set the warmup mode for the DeepConf state
 void deepconf_set_warmup_mode(deepconf_state * state, deepconf_state::deepconf_warmup_mode mode);
+
+// Function to be called when a trace is finished to collect C_least score during warmup
+void deepconf_end_trace(deepconf_state * state);
 
 // Ensemble Consensus Stop functions
 void deepconf_add_token_to_current_trace(deepconf_state * state, llama_token token);
@@ -259,3 +274,17 @@ void deepconf_print_state(const deepconf_state * state);
 
 // Print human-readable parameter information
 std::string deepconf_params_to_string(const deepconf_params & params);
+
+// Filter traces based on confidence percentiles
+// Returns indices of traces to keep (top gamma_filter_percent% of traces)
+std::vector<size_t> deepconf_filter_traces_by_confidence(
+    const std::vector<float> & trace_confidences,
+    float gamma_filter_percent);
+
+// Perform confidence-weighted majority voting
+// trace_answers: Vector of answer token sequences from different traces
+// trace_confidences: Vector of confidence scores for each trace
+// Returns: The voted answer token sequence
+std::vector<llama_token> deepconf_weighted_majority_voting(
+    const std::vector<std::vector<llama_token>> & trace_answers,
+    const std::vector<float> & trace_confidences);

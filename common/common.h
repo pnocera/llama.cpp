@@ -13,6 +13,7 @@
 
 #include "ggml-opt.h"
 #include "llama-cpp.h"
+#include "deepconf.h"
 
 #ifdef _WIN32
 #define DIRECTORY_SEPARATOR '\\'
@@ -133,6 +134,7 @@ struct common_grammar_trigger {
 // sampling parameters
 struct common_params_sampling {
     uint32_t seed = LLAMA_DEFAULT_SEED; // the seed used to initialize llama_sampler
+    deepconf_params deepconf;
 
     int32_t n_prev             = 64;    // number of previous tokens to remember
     int32_t n_probs            = 0;     // if greater than 0, output the probabilities of top n_probs tokens.
@@ -200,6 +202,10 @@ struct common_params_sampling {
     bool    deepconf_ensemble_enabled    = false;   // enable DeepConf Ensemble Consensus Stop
     float   deepconf_consensus_threshold = 0.95f;   // consensus threshold for early stopping (0.0-1.0)
     bool    deepconf_consensus_stop_signaled = false; // signal to stop all traces due to consensus
+
+    // DeepConf: Offline Filtering/Voting parameters
+    int32_t deepconf_n_gen_traces = 1; // Number of independent generation traces to run for offline filtering/voting
+    float   deepconf_gamma_filter_percent = 20.0f; // Percentage of lowest confidence traces to discard (0.0-100.0)
 
     // print the parameters into a string
     std::string print() const;

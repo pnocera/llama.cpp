@@ -227,9 +227,12 @@ void common_sampler_free(struct common_sampler * gsmpl) {
         llama_sampler_free(gsmpl->grmr);
 
         llama_sampler_free(gsmpl->chain);
-
-        deepconf_free(gsmpl->deepconf);
-
+ 
+        if (gsmpl->deepconf) {
+            deepconf_end_trace(gsmpl->deepconf); // Call end_trace before freeing
+            deepconf_free(gsmpl->deepconf);
+        }
+ 
         delete gsmpl;
     }
 }
@@ -421,7 +424,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         result.push_back(id);
     }
-
+    
+    // Call deepconf_end_trace when a trace finishes
+    if (gsmpl->deepconf) {
+        deepconf_end_trace(gsmpl->deepconf);
+    }
+ 
     return result;
 }
 
@@ -698,4 +706,43 @@ std::string common_sampler_deepconf_stats(const struct common_sampler * gsmpl) {
         << ", should_stop=" << (stats.early_stop_triggered ? "true" : "false");
     
     return oss.str();
+}
+
+// DeepConf: Apply offline filtering and weighted majority voting to a set of traces
+std::vector<llama_token> common_sampler_deepconf_apply_offline_post_processing(
+    struct common_sampler * gsmpl,
+    const std::vector<std::vector<llama_token>> & all_traces,
+    const std::vector<float> & all_trace_confidences,
+    float gamma_filter_percent) {
+    
+    if (!gsmpl || !gsmpl->deepconf) {
+        LOG_ERR("DeepConf is not enabled or state is null, cannot perform offline post-processing.\n");
+        return {};
+    }
+
+    if (all_traces.empty() || all_traces.size() != all_trace_confidences.size()) {
+        LOG_ERR("Input traces and confidences are inconsistent or empty.\n");
+        return {};
+    }
+
+    // 1. Apply confidence filtering
+    std::vector<size_t> filtered_indices = deepconf_filter_traces_by_confidence(all_trace_confidences, gamma_filter_percent);
+
+    if (filtered_indices.empty()) {
+        LOG_WRN("Confidence filtering resulted in no traces. Returning empty result.\n");
+        return {};
+    }
+
+    std::vector<std::vector<llama_token>> filtered_traces;
+    std::vector<float> filtered_confidences;
+    filtered_traces.reserve(filtered_indices.size());
+    filtered_confidences.reserve(filtered_indices.size());
+
+    for (size_t index : filtered_indices) {
+        filtered_traces.push_back(all_traces[index]);
+        filtered_confidences.push_back(all_trace_confidences[index]);
+    }
+
+    // 2. Perform confidence-weighted majority voting on the filtered traces
+    return deepconf_weighted_majority_voting(filtered_traces, filtered_confidences);
 }

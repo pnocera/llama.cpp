@@ -2112,6 +2112,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_sparam());
 
+    // DeepConf: Offline Filtering/Voting parameters
+    add_opt(common_arg(
+        {"--deepconf-n-gen-traces"}, "N",
+        string_format("DeepConf number of independent generation traces to run for offline filtering/voting (default: %d)", params.sampling.deepconf_n_gen_traces),
+        [](common_params & params, int value) {
+            params.sampling.deepconf_n_gen_traces = std::max(1, value);
+        }
+    ).set_sparam());
+    add_opt(common_arg(
+        {"--deepconf-gamma-filter-percent"}, "N",
+        string_format("DeepConf percentage of lowest confidence traces to filter out (default: %.1f, range: 0.0-100.0)", (double)params.sampling.deepconf_gamma_filter_percent),
+        [](common_params & params, const std::string & value) {
+            params.sampling.deepconf_gamma_filter_percent = std::max(0.0f, std::min(100.0f, std::stof(value)));
+        }
+    ).set_sparam());
+    add_opt(common_arg(
+        {"--deepconf-tail-size"}, "N",
+        string_format("DeepConf tail size for C_tail calculation (default: %zu)", params.sampling.deepconf.tail_size),
+        [](common_params & params, int value) {
+            params.sampling.deepconf.tail_size = std::max((size_t)1, (size_t)value);
+        }
+    ).set_sparam());
+    add_opt(common_arg(
+        {"--deepconf-bottom-n"}, "N",
+        string_format("DeepConf N for C_bottom-N calculation (default: %zu)", params.sampling.deepconf.bottom_n),
+        [](common_params & params, int value) {
+            params.sampling.deepconf.bottom_n = std::max((size_t)1, (size_t)value);
+        }
+    ).set_sparam());
+
     add_opt(common_arg(
         {"--pooling"}, "{none,mean,cls,last,rank}",
         "pooling type for embeddings, use model default if unspecified",

@@ -19,6 +19,9 @@ TOPK=""
 WARMUP=""
 WARMUP_TRACES=""
 WARMUP_PERCENTILE=""
+NUM_GEN_TRACES=""
+GAMMA_FILTER_PERCENT=""
+NGL="" # Initialize NGL
 
 # Server URL for API mode (default matches llama-server default port)
 SERVER_URL="http://localhost:8080"
@@ -55,6 +58,9 @@ Options:
   -W                    Enable DeepConf Offline Warmup for dynamic threshold
   -T WARMUP_TRACES      Number of traces for Offline Warmup (default: 16)
   -P PERCENTILE         Percentile for dynamic threshold (90=DeepConf-low, 10=DeepConf-high, default: 90)
+  -N NUM_GEN_TRACES     DeepConf number of independent generation traces for offline filtering/voting (default: 1)
+  -G GAMMA_FILTER_PERCENT DeepConf percentage of lowest confidence traces to filter out (default: 20.0, range: 0.0-100.0)
+  -l NGL                Number of layers to offload to GPU (default: 0)
   -U SERVER_URL         Server URL for API mode (default: http://localhost:8080)
   -h                    Show this help message
 
@@ -74,11 +80,11 @@ Examples:
   # Use llama-server on custom port 8083 with explicit DeepConf config
   $0 -m model.gguf -a -U http://127.0.0.1:8083 -n 10 -t 2.5 -w 16 -k 6
 
+
 EOF
 }
-
 # Parse command line arguments
-while getopts "m:n:svat:w:k:W:T:P:U:h" opt; do
+while getopts "m:n:svat:w:k:WT:P:N:G:U:l:h" opt; do
     case $opt in
         m)
             MODEL_PATH="$OPTARG"
@@ -104,13 +110,6 @@ while getopts "m:n:svat:w:k:W:T:P:U:h" opt; do
         k)
             TOPK="$OPTARG"
             ;;
-        U)
-            SERVER_URL="$OPTARG"
-            ;;
-        h)
-            show_usage
-            exit 0
-            ;;
         W)
             WARMUP="true"
             ;;
@@ -119,6 +118,22 @@ while getopts "m:n:svat:w:k:W:T:P:U:h" opt; do
             ;;
         P)
             WARMUP_PERCENTILE="$OPTARG"
+            ;;
+        N)
+            NUM_GEN_TRACES="$OPTARG"
+            ;;
+        G)
+            GAMMA_FILTER_PERCENT="$OPTARG"
+            ;;
+        U)
+            SERVER_URL="$OPTARG"
+            ;;
+        l)
+            NGL="$OPTARG"
+            ;;
+        h)
+            show_usage
+            exit 0
             ;;
         \?)
             print_color "Invalid option: -$OPTARG" "$RED"
@@ -197,6 +212,12 @@ fi
 if [ -n "$WARMUP_PERCENTILE" ]; then
     CMD="$CMD --deepconf-warmup-percentile $WARMUP_PERCENTILE"
 fi
+if [ -n "$NUM_GEN_TRACES" ]; then
+    CMD="$CMD --deepconf-n-gen-traces $NUM_GEN_TRACES"
+fi
+if [ -n "$GAMMA_FILTER_PERCENT" ]; then
+    CMD="$CMD --deepconf-gamma-filter-percent $GAMMA_FILTER_PERCENT"
+fi
 
 if [ "$MODE" = "api" ]; then
     CMD="$CMD --use-server --server-url \"$SERVER_URL\""
@@ -210,6 +231,11 @@ if [ "$MODE" = "api" ]; then
             echo ""
         }
     fi
+fi
+
+# Add NGL if specified
+if [ -n "$NGL" ]; then
+    CMD="$CMD --ngl $NGL"
 fi
 
 # Create results directory
@@ -236,6 +262,12 @@ if [ -n "$THRESHOLD" ] || [ -n "$WINDOW" ] || [ -n "$TOPK" ]; then
   [ -n "$WARMUP_PERCENTILE" ] && echo "  warmup percentile: $WARMUP_PERCENTILE"
 fi
 echo ""
+
+# Debug print command
+if [ -n "$VERBOSE" ]; then
+    echo "Debug: Executing command:"
+    echo "  $CMD"
+fi
 
 # Execute benchmark
 eval $CMD
