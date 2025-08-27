@@ -8,99 +8,6 @@
 #include <unordered_map>
 #include <algorithm>
 
-// the ring buffer works similarly to std::deque, but with a fixed capacity
-// TODO: deduplicate with llama-impl.h
-template<typename T>
-struct ring_buffer {
-    ring_buffer(size_t cap) : capacity(cap), data(cap) {}
-
-    T & front() {
-        if (sz == 0) {
-            throw std::runtime_error("ring buffer is empty");
-        }
-        return data[first];
-    }
-
-    const T & front() const {
-        if (sz == 0) {
-            throw std::runtime_error("ring buffer is empty");
-        }
-        return data[first];
-    }
-
-    T & back() {
-        if (sz == 0) {
-            throw std::runtime_error("ring buffer is empty");
-        }
-        return data[pos];
-    }
-
-    const T & back() const {
-        if (sz == 0) {
-            throw std::runtime_error("ring buffer is empty");
-        }
-        return data[pos];
-    }
-
-    void push_back(const T & value) {
-        if (sz == capacity) {
-            // advance the start when buffer is full
-            first = (first + 1) % capacity;
-        } else {
-            sz++;
-        }
-        data[pos] = value;
-        pos = (pos + 1) % capacity;
-    }
-
-    T pop_front() {
-        if (sz == 0) {
-            throw std::runtime_error("ring buffer is empty");
-        }
-        T value = data[first];
-        first = (first + 1) % capacity;
-        sz--;
-        return value;
-    }
-
-    const T & rat(size_t i) const {
-        if (i >= sz) {
-            throw std::runtime_error("ring buffer: index out of bounds");
-        }
-        return data[(first + sz - i - 1) % capacity];
-    }
-
-    std::vector<T> to_vector() const {
-        std::vector<T> result;
-        result.reserve(sz);
-        for (size_t i = 0; i < sz; i++) {
-            result.push_back(data[(first + i) % capacity]);
-        }
-        return result;
-    }
-
-    void clear() {
-        // here only reset the status of the buffer
-        sz = 0;
-        first = 0;
-        pos = 0;
-    }
-
-    bool empty() const {
-        return sz == 0;
-    }
-
-    size_t size() const {
-        return sz;
-    }
-
-    size_t capacity = 0;
-    size_t sz = 0;
-    size_t first = 0;
-    size_t pos = 0;
-    std::vector<T> data;
-};
-
 struct common_sampler {
     common_params_sampling params;
 
@@ -292,12 +199,25 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, co
     }
 
     // Initialize DeepConf state if enabled
-    deepconf_params deepconf_p;
-    deepconf_p.enabled = params.deepconf_enabled;
-    deepconf_p.window_size = (size_t)params.deepconf_window_size;
-    deepconf_p.threshold = params.deepconf_threshold;
-    deepconf_p.top_k = params.deepconf_top_k;
-    result->deepconf = deepconf_init(deepconf_p);
+    if (params.deepconf_enabled) {
+        deepconf_params deepconf_p;
+        deepconf_p.enabled = params.deepconf_enabled;
+        deepconf_p.window_size = (size_t)params.deepconf_window_size;
+        deepconf_p.threshold = params.deepconf_threshold;
+        deepconf_p.top_k = (size_t)params.deepconf_top_k;
+        deepconf_p.warmup_enabled = params.deepconf_warmup_enabled;
+        deepconf_p.warmup_traces = params.deepconf_warmup_traces;
+        deepconf_p.warmup_percentile = params.deepconf_warmup_percentile;
+        deepconf_p.ensemble_enabled = params.deepconf_ensemble_enabled;
+        deepconf_p.consensus_threshold = params.deepconf_consensus_threshold;
+        result->deepconf = deepconf_init(deepconf_p);
+        
+        if (!result->deepconf) {
+            LOG_WRN("DeepConf initialization returned nullptr despite being enabled\n");
+        }
+    } else {
+        result->deepconf = nullptr;
+    }
 
     return result;
 }
@@ -307,9 +227,12 @@ void common_sampler_free(struct common_sampler * gsmpl) {
         llama_sampler_free(gsmpl->grmr);
 
         llama_sampler_free(gsmpl->chain);
-
-        deepconf_free(gsmpl->deepconf);
-
+ 
+        if (gsmpl->deepconf) {
+            deepconf_end_trace(gsmpl->deepconf); // Call end_trace before freeing
+            deepconf_free(gsmpl->deepconf);
+        }
+ 
         delete gsmpl;
     }
 }
@@ -401,7 +324,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         if (is_valid) {
             // Update DeepConf confidence tracking
             if (gsmpl->deepconf) {
-                deepconf_process_token(gsmpl->deepconf, &cur_p);
+                deepconf_process_token(gsmpl->deepconf, &cur_p, id);
             }
             return id;
         }
@@ -418,10 +341,61 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 
     // Update DeepConf confidence tracking
     if (gsmpl->deepconf) {
-        deepconf_process_token(gsmpl->deepconf, &cur_p);
+        deepconf_process_token(gsmpl->deepconf, &cur_p, cur_p.data[cur_p.selected].id);
     }
 
     return cur_p.data[cur_p.selected].id;
+}
+
+float common_sampler_sample_with_confidence(struct common_sampler * gsmpl, struct llama_context * ctx, llama_token_data_array * candidates, int32_t * token_id) {
+    // Copy the candidates to our internal structure
+    gsmpl->cur_p = *candidates;
+
+    auto & grmr  = gsmpl->grmr;
+    auto & chain = gsmpl->chain;
+    auto & cur_p = gsmpl->cur_p;
+
+    // Apply the sampling chain
+    llama_sampler_apply(chain, &cur_p);
+
+    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
+
+    const llama_token id = cur_p.data[cur_p.selected].id;
+
+    // Check if the sampled token fits the grammar
+    {
+        llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
+        llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
+
+        llama_sampler_apply(grmr, &single_token_data_array);
+
+        const bool is_valid = single_token_data_array.data[0].logit != -INFINITY;
+        if (is_valid) {
+            // Update DeepConf confidence tracking
+            if (gsmpl->deepconf) {
+                deepconf_process_token(gsmpl->deepconf, &cur_p, id);
+                if (token_id) *token_id = id;
+                return deepconf_get_group_confidence(gsmpl->deepconf);
+            }
+            if (token_id) *token_id = id;
+            return 0.0f;
+        }
+    }
+
+    // Resampling path - apply grammar then chain again
+    llama_sampler_apply(grmr,  &cur_p);
+    llama_sampler_apply(chain, &cur_p);
+
+    GGML_ASSERT(cur_p.selected != -1 && "no selected token during re-sampling - check your sampling configuration");
+
+    // Update DeepConf confidence tracking
+    if (gsmpl->deepconf) {
+        deepconf_process_token(gsmpl->deepconf, &cur_p, cur_p.data[cur_p.selected].id);
+        if (token_id) *token_id = cur_p.data[cur_p.selected].id;
+        return deepconf_get_group_confidence(gsmpl->deepconf);
+    }
+    if (token_id) *token_id = cur_p.data[cur_p.selected].id;
+    return 0.0f;
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
@@ -450,7 +424,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         result.push_back(id);
     }
-
+    
+    // Call deepconf_end_trace when a trace finishes
+    if (gsmpl->deepconf) {
+        deepconf_end_trace(gsmpl->deepconf);
+    }
+ 
     return result;
 }
 
@@ -637,6 +616,77 @@ float common_sampler_get_confidence(const struct common_sampler * gsmpl) {
     return deepconf_get_group_confidence(gsmpl->deepconf);
 }
 
+void common_sampler_deepconf_reset(struct common_sampler * gsmpl) {
+    if (gsmpl && gsmpl->deepconf) {
+        deepconf_reset(gsmpl->deepconf);
+    }
+}
+
+void common_sampler_deepconf_set_warmup_mode(struct common_sampler * gsmpl, enum deepconf_state::deepconf_warmup_mode mode) {
+    if (gsmpl && gsmpl->deepconf) {
+        deepconf_set_warmup_mode(gsmpl->deepconf, mode);
+    }
+}
+
+float common_sampler_deepconf_get_min_group_confidence(const struct common_sampler * gsmpl) {
+    if (!gsmpl || !gsmpl->deepconf) {
+        return 0.0f; // Or some other appropriate default/error value
+    }
+    return deepconf_get_min_group_confidence(gsmpl->deepconf);
+}
+
+void common_sampler_deepconf_set_stopping_threshold(struct common_sampler * gsmpl, float threshold) {
+    if (gsmpl && gsmpl->deepconf) {
+        deepconf_set_stopping_threshold(gsmpl->deepconf, threshold);
+    }
+}
+
+void common_sampler_deepconf_add_token_to_current_trace(struct common_sampler * gsmpl, llama_token token) {
+    if (gsmpl && gsmpl->deepconf) {
+        deepconf_add_token_to_current_trace(gsmpl->deepconf, token);
+    }
+}
+
+void common_sampler_deepconf_clear_current_trace_tokens(struct common_sampler * gsmpl) {
+    if (gsmpl && gsmpl->deepconf) {
+        deepconf_clear_current_trace_tokens(gsmpl->deepconf);
+    }
+}
+
+const std::vector<llama_token> & common_sampler_deepconf_get_current_trace_tokens(const struct common_sampler * gsmpl) {
+    if (!gsmpl || !gsmpl->deepconf) {
+        static const std::vector<llama_token> empty;
+        return empty;
+    }
+    return deepconf_get_current_trace_tokens(gsmpl->deepconf);
+}
+
+void common_sampler_deepconf_add_answer_vote(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<llama_token> & answer) {
+    if (gsmpl && gsmpl->deepconf) {
+        deepconf_add_answer_vote(gsmpl->deepconf, answer);
+    }
+}
+
+void common_sampler_deepconf_calculate_consensus(struct common_sampler * gsmpl) {
+    if (gsmpl && gsmpl->deepconf) {
+        deepconf_calculate_consensus(gsmpl->deepconf);
+    }
+}
+
+bool common_sampler_deepconf_check_consensus(const struct common_sampler * gsmpl) {
+    if (gsmpl && gsmpl->deepconf) {
+        return deepconf_check_consensus(gsmpl->deepconf);
+    }
+    return false;
+}
+// DeepConf: check if early stopping should occur based on current confidence state
+bool common_sampler_deepconf_should_stop(const struct common_sampler * gsmpl) {
+    if (!gsmpl || !gsmpl->deepconf) {
+        return false;
+    }
+    return deepconf_should_stop(gsmpl->deepconf);
+}
+
 std::string common_sampler_deepconf_stats(const struct common_sampler * gsmpl) {
     if (!gsmpl || !gsmpl->deepconf) {
         return "DeepConf: disabled";
@@ -652,7 +702,47 @@ std::string common_sampler_deepconf_stats(const struct common_sampler * gsmpl) {
         << ", tokens_processed=" << stats.tokens_processed
         << ", last_token_conf=" << stats.last_token_confidence
         << ", group_conf=" << stats.last_group_confidence
+        << ", min_group_conf=" << stats.min_group_confidence
         << ", should_stop=" << (stats.early_stop_triggered ? "true" : "false");
     
     return oss.str();
+}
+
+// DeepConf: Apply offline filtering and weighted majority voting to a set of traces
+std::vector<llama_token> common_sampler_deepconf_apply_offline_post_processing(
+    struct common_sampler * gsmpl,
+    const std::vector<std::vector<llama_token>> & all_traces,
+    const std::vector<float> & all_trace_confidences,
+    float gamma_filter_percent) {
+    
+    if (!gsmpl || !gsmpl->deepconf) {
+        LOG_ERR("DeepConf is not enabled or state is null, cannot perform offline post-processing.\n");
+        return {};
+    }
+
+    if (all_traces.empty() || all_traces.size() != all_trace_confidences.size()) {
+        LOG_ERR("Input traces and confidences are inconsistent or empty.\n");
+        return {};
+    }
+
+    // 1. Apply confidence filtering
+    std::vector<size_t> filtered_indices = deepconf_filter_traces_by_confidence(all_trace_confidences, gamma_filter_percent);
+
+    if (filtered_indices.empty()) {
+        LOG_WRN("Confidence filtering resulted in no traces. Returning empty result.\n");
+        return {};
+    }
+
+    std::vector<std::vector<llama_token>> filtered_traces;
+    std::vector<float> filtered_confidences;
+    filtered_traces.reserve(filtered_indices.size());
+    filtered_confidences.reserve(filtered_indices.size());
+
+    for (size_t index : filtered_indices) {
+        filtered_traces.push_back(all_traces[index]);
+        filtered_confidences.push_back(all_trace_confidences[index]);
+    }
+
+    // 2. Perform confidence-weighted majority voting on the filtered traces
+    return deepconf_weighted_majority_voting(filtered_traces, filtered_confidences);
 }

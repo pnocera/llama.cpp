@@ -40,6 +40,7 @@ enum stop_type {
     STOP_TYPE_EOS,
     STOP_TYPE_WORD,
     STOP_TYPE_LIMIT,
+    STOP_TYPE_DEEPCONF,
 };
 
 // state diagram: https://github.com/ggml-org/llama.cpp/pull/9283
@@ -630,10 +631,11 @@ using server_task_result_ptr = std::unique_ptr<server_task_result>;
 
 inline std::string stop_type_to_str(stop_type type) {
     switch (type) {
-        case STOP_TYPE_EOS:   return "eos";
-        case STOP_TYPE_WORD:  return "word";
-        case STOP_TYPE_LIMIT: return "limit";
-        default:              return "none";
+        case STOP_TYPE_EOS:       return "eos";
+        case STOP_TYPE_WORD:      return "word";
+        case STOP_TYPE_LIMIT:     return "limit";
+        case STOP_TYPE_DEEPCONF:  return "deepconf";
+        default:                  return "none";
     }
 }
 
@@ -3654,6 +3656,19 @@ struct server_context {
                 llama_token id = common_sampler_sample(slot.smpl, ctx, tok_idx);
 
                 slot.i_batch = -1;
+
+                // DeepConf early-stopping: if triggered, do not accept or append this token
+                if (common_sampler_should_stop(slot.smpl)) {
+                    slot.stop = STOP_TYPE_DEEPCONF;
+                    slot.has_next_token = false;
+
+                    // finalize without accepting the sampled token
+                    slot.release();
+                    slot.print_timings();
+                    send_final_response(slot);
+                    metrics.on_prediction(slot);
+                    continue; // proceed to next slot
+                }
 
                 common_sampler_accept(slot.smpl, id, true);
 

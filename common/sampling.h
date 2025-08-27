@@ -4,6 +4,8 @@
 
 #include "common.h"
 
+#include "deepconf.h"
+struct deepconf_state;
 #include <string>
 #include <vector>
 
@@ -103,9 +105,34 @@ char        common_sampler_type_to_chr(enum common_sampler_type cnstr);
 
 // check if early stopping should occur based on current confidence state
 bool common_sampler_should_stop(const struct common_sampler * gsmpl);
+bool common_sampler_deepconf_should_stop(const struct common_sampler * gsmpl);
 
 // get current group confidence for monitoring
 float common_sampler_get_confidence(const struct common_sampler * gsmpl);
+
+// DeepConf: Warmup and Threshold management
+void common_sampler_deepconf_reset(struct common_sampler * gsmpl);
+void common_sampler_deepconf_set_warmup_mode(struct common_sampler * gsmpl, deepconf_state::deepconf_warmup_mode mode);
+float common_sampler_deepconf_get_min_group_confidence(const struct common_sampler * gsmpl);
+void common_sampler_deepconf_set_stopping_threshold(struct common_sampler * gsmpl, float threshold);
+
+// Ensemble Consensus Stop functions
+void common_sampler_deepconf_add_token_to_current_trace(struct common_sampler * gsmpl, llama_token token);
+void common_sampler_deepconf_clear_current_trace_tokens(struct common_sampler * gsmpl);
+const std::vector<llama_token> & common_sampler_deepconf_get_current_trace_tokens(const struct common_sampler * gsmpl);
+void common_sampler_deepconf_add_answer_vote(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<llama_token> & answer);
+void common_sampler_deepconf_calculate_consensus(struct common_sampler * gsmpl);
+bool common_sampler_deepconf_check_consensus(const struct common_sampler * gsmpl);
+
+// extended sampling implementation that returns confidence
+float common_sampler_sample_with_confidence(struct common_sampler * gsmpl, struct llama_context * ctx, llama_token_data_array * candidates, int32_t * token_id);
+
+// DeepConf: Apply offline filtering and weighted majority voting to a set of traces
+std::vector<llama_token> common_sampler_deepconf_apply_offline_post_processing(
+    struct common_sampler * gsmpl,
+    const std::vector<std::vector<llama_token>> & all_traces,
+    const std::vector<float> & all_trace_confidences,
+    float gamma_filter_percent);
 
 // get DeepConf statistics for debugging
 std::string common_sampler_deepconf_stats(const struct common_sampler * gsmpl);

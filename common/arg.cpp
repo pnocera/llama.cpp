@@ -2059,16 +2059,86 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_sparam());
     add_opt(common_arg(
         {"--deepconf-threshold"}, "N",
-        string_format("DeepConf confidence threshold for early stopping (default: %.1f)", (double)params.sampling.deepconf_threshold),
+        string_format("DeepConf confidence threshold for early stopping (default: %.1f, range: 0.1-100.0)", (double)params.sampling.deepconf_threshold),
         [](common_params & params, const std::string & value) {
-            params.sampling.deepconf_threshold = std::max(0.1f, std::min(2.0f, std::stof(value)));
+            params.sampling.deepconf_threshold = std::max(0.1f, std::min(100.0f, std::stof(value)));
         }
     ).set_sparam());
     add_opt(common_arg(
         {"--deepconf-top-k"}, "N",
-        string_format("DeepConf number of top tokens for confidence calculation (default: %d)", params.sampling.deepconf_top_k),
+        string_format("DeepConf number of runner-up tokens (beta) used for confidence calculation (default: %d)", params.sampling.deepconf_top_k),
         [](common_params & params, int value) {
-            params.sampling.deepconf_top_k = std::max(1, std::min(40, value));
+            // Require at least 2 to ensure one runner-up after excluding the winning token
+            params.sampling.deepconf_top_k = std::max(2, std::min(40, value));
+        }
+    ).set_sparam());
+
+    // DeepConf: Offline Warmup parameters
+    add_opt(common_arg(
+        {"--deepconf-warmup-enabled"},
+        "enable DeepConf Offline Warmup for dynamic threshold (default: false)",
+        [](common_params & params) {
+            params.sampling.deepconf_warmup_enabled = true;
+        }
+    ).set_sparam());
+    add_opt(common_arg(
+        {"--deepconf-warmup-traces"}, "N",
+        string_format("DeepConf number of traces to run for warmup (default: %d)", params.sampling.deepconf_warmup_traces),
+        [](common_params & params, int value) {
+            params.sampling.deepconf_warmup_traces = std::max(1, value);
+        }
+    ).set_sparam());
+    add_opt(common_arg(
+        {"--deepconf-warmup-percentile"}, "N",
+        string_format("DeepConf percentile for dynamic threshold (default: %d, range: 0-100)", params.sampling.deepconf_warmup_percentile),
+        [](common_params & params, int value) {
+            params.sampling.deepconf_warmup_percentile = std::max(0, std::min(100, value));
+        }
+    ).set_sparam());
+
+    // DeepConf: Ensemble Consensus parameters
+    add_opt(common_arg(
+        {"--deepconf-ensemble-enabled"},
+        "enable DeepConf Ensemble Consensus Stop (default: false)",
+        [](common_params & params) {
+            params.sampling.deepconf_ensemble_enabled = true;
+        }
+    ).set_sparam());
+    add_opt(common_arg(
+        {"--deepconf-consensus-threshold"}, "N",
+        string_format("DeepConf consensus threshold for early stopping (default: %.2f, range: 0.0-1.0)", (double)params.sampling.deepconf_consensus_threshold),
+        [](common_params & params, const std::string & value) {
+            params.sampling.deepconf_consensus_threshold = std::max(0.0f, std::min(1.0f, std::stof(value)));
+        }
+    ).set_sparam());
+
+    // DeepConf: Offline Filtering/Voting parameters
+    add_opt(common_arg(
+        {"--deepconf-n-gen-traces"}, "N",
+        string_format("DeepConf number of independent generation traces to run for offline filtering/voting (default: %d)", params.sampling.deepconf_n_gen_traces),
+        [](common_params & params, int value) {
+            params.sampling.deepconf_n_gen_traces = std::max(1, value);
+        }
+    ).set_sparam());
+    add_opt(common_arg(
+        {"--deepconf-gamma-filter-percent"}, "N",
+        string_format("DeepConf percentage of lowest confidence traces to filter out (default: %.1f, range: 0.0-100.0)", (double)params.sampling.deepconf_gamma_filter_percent),
+        [](common_params & params, const std::string & value) {
+            params.sampling.deepconf_gamma_filter_percent = std::max(0.0f, std::min(100.0f, std::stof(value)));
+        }
+    ).set_sparam());
+    add_opt(common_arg(
+        {"--deepconf-tail-size"}, "N",
+        string_format("DeepConf tail size for C_tail calculation (default: %zu)", params.sampling.deepconf.tail_size),
+        [](common_params & params, int value) {
+            params.sampling.deepconf.tail_size = std::max((size_t)1, (size_t)value);
+        }
+    ).set_sparam());
+    add_opt(common_arg(
+        {"--deepconf-bottom-n"}, "N",
+        string_format("DeepConf N for C_bottom-N calculation (default: %zu)", params.sampling.deepconf.bottom_n),
+        [](common_params & params, int value) {
+            params.sampling.deepconf.bottom_n = std::max((size_t)1, (size_t)value);
         }
     ).set_sparam());
 
