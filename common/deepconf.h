@@ -214,6 +214,15 @@ float deepconf_get_min_group_confidence(const deepconf_state * state);
 // Set the dynamic stopping threshold for the DeepConf state
 void deepconf_set_stopping_threshold(deepconf_state * state, float threshold);
 
+// Calculate percentile value from vector of floats
+// percentile: 0-100 (e.g., 90 for 90th percentile)
+float deepconf_calculate_percentile(std::vector<float> & data, int percentile);
+
+// Set adaptive threshold based on warmup scores and desired aggressiveness
+// state: DeepConf state with collected warmup scores
+// percentile: Desired percentile (e.g., 90 for aggressive "DeepConf-low", 10 for conservative "DeepConf-high")
+void deepconf_set_adaptive_threshold(deepconf_state * state, int percentile);
+
 // Set the warmup mode for the DeepConf state
 void deepconf_set_warmup_mode(deepconf_state * state, deepconf_state::deepconf_warmup_mode mode);
 

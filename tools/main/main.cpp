@@ -477,7 +477,6 @@ int main(int argc, char ** argv) {
     // Offline Warmup (Method A)
     if (sparams.deepconf_warmup_enabled && !params.interactive) {
         LOG_INF("Starting Offline Warmup with %d traces and %d%% percentile\n", sparams.deepconf_warmup_traces, sparams.deepconf_warmup_percentile);
-        
         // Store initial prompt size to restore after each trace
         const int32_t initial_prompt_size = embd_inp.size();
         
@@ -502,7 +501,8 @@ int main(int argc, char ** argv) {
             llama_token id = 0;
             while (n_rem > 0) {
                 llama_token_data_array * candidates = common_sampler_get_candidates(smpl);
-                const float confidence = common_sampler_sample_with_confidence(smpl, ctx, candidates, &id);
+                // Sample with confidence (needed for DeepConf)
+                common_sampler_sample_with_confidence(smpl, ctx, candidates, &id);
                 
                 // Accept the predicted token into the context
                 common_sampler_accept(smpl, id, true);
@@ -555,6 +555,9 @@ int main(int argc, char ** argv) {
             // Apply the new threshold to the main sampler
             common_sampler_deepconf_set_stopping_threshold(smpl, dynamic_threshold);
             
+            // Debug: Print the current threshold value
+            LOG_INF("Applied dynamic threshold to sampler: %.6f\n", dynamic_threshold);
+            
             // Return sampler to normal operation mode
             common_sampler_deepconf_set_warmup_mode(smpl, deepconf_state::DEEPCONF_WARMUP_MODE_NONE);
         } else {
@@ -562,7 +565,7 @@ int main(int argc, char ** argv) {
             // Disable DeepConf if warmup failed
         }
     } else if (sparams.deepconf_warmup_enabled && params.interactive) {
-      LOG_INF("DeepConf warmup enabled but in interactive mode - skipping warmup\n");
+        LOG_INF("DeepConf warmup enabled but in interactive mode - skipping warmup\n");
     }
 
     LOG_INF("generate: n_ctx = %d, n_batch = %d, n_predict = %d, n_keep = %d\n", n_ctx, params.n_batch, params.n_predict, params.n_keep);

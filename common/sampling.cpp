@@ -344,32 +344,22 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return cur_p.data[cur_p.selected].id;
 }
 
-float common_sampler_sample_with_confidence(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool is_group, bool grammar_first) {
-    gsmpl->set_logits(ctx, idx);
+float common_sampler_sample_with_confidence(struct common_sampler * gsmpl, struct llama_context * ctx, llama_token_data_array * candidates, int32_t * token_id) {
+    // Copy the candidates to our internal structure
+    gsmpl->cur_p = *candidates;
 
     auto & grmr  = gsmpl->grmr;
     auto & chain = gsmpl->chain;
-    auto & cur_p = gsmpl->cur_p; // initialized by set_logits
+    auto & cur_p = gsmpl->cur_p;
 
-    if (grammar_first) {
-        llama_sampler_apply(grmr, &cur_p);
-    }
-
+    // Apply the sampling chain
     llama_sampler_apply(chain, &cur_p);
 
     GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
 
     const llama_token id = cur_p.data[cur_p.selected].id;
 
-    if (grammar_first) {
-        if (gsmpl->deepconf) {
-            deepconf_process_token(gsmpl->deepconf, &cur_p, id);
-            return deepconf_get_group_confidence(gsmpl->deepconf);
-        }
-        return 0.0f; // Should not happen if DeepConf is enabled
-    }
-
-    // check if it the sampled token fits the grammar
+    // Check if the sampled token fits the grammar
     {
         llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
         llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
@@ -381,16 +371,15 @@ float common_sampler_sample_with_confidence(struct common_sampler * gsmpl, struc
             // Update DeepConf confidence tracking
             if (gsmpl->deepconf) {
                 deepconf_process_token(gsmpl->deepconf, &cur_p, id);
+                if (token_id) *token_id = id;
                 return deepconf_get_group_confidence(gsmpl->deepconf);
             }
-            return 0.0f; // Should not happen if DeepConf is enabled
+            if (token_id) *token_id = id;
+            return 0.0f;
         }
     }
 
-    // resampling:
-    // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
-    gsmpl->set_logits(ctx, idx);
-
+    // Resampling path - apply grammar then chain again
     llama_sampler_apply(grmr,  &cur_p);
     llama_sampler_apply(chain, &cur_p);
 
@@ -399,9 +388,11 @@ float common_sampler_sample_with_confidence(struct common_sampler * gsmpl, struc
     // Update DeepConf confidence tracking
     if (gsmpl->deepconf) {
         deepconf_process_token(gsmpl->deepconf, &cur_p, cur_p.data[cur_p.selected].id);
+        if (token_id) *token_id = cur_p.data[cur_p.selected].id;
         return deepconf_get_group_confidence(gsmpl->deepconf);
     }
-    return 0.0f; // Should not happen if DeepConf is enabled
+    if (token_id) *token_id = cur_p.data[cur_p.selected].id;
+    return 0.0f;
 }
 
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
@@ -679,6 +670,13 @@ bool common_sampler_deepconf_check_consensus(const struct common_sampler * gsmpl
         return deepconf_check_consensus(gsmpl->deepconf);
     }
     return false;
+}
+// DeepConf: check if early stopping should occur based on current confidence state
+bool common_sampler_deepconf_should_stop(const struct common_sampler * gsmpl) {
+    if (!gsmpl || !gsmpl->deepconf) {
+        return false;
+    }
+    return deepconf_should_stop(gsmpl->deepconf);
 }
 
 std::string common_sampler_deepconf_stats(const struct common_sampler * gsmpl) {

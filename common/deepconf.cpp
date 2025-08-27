@@ -212,6 +212,8 @@ float deepconf_calculate_token_confidence(
         sum_log_probs += logf(pool[j].first);
         taken++;
     }
+    
+    
 
     if (taken == 0) {
         return 0.0f;
@@ -219,7 +221,37 @@ float deepconf_calculate_token_confidence(
 
     return -sum_log_probs / (float) taken;
 }
-
+// Calculate percentile of a vector of float values
+// percentile: 0-100, where 0 is minimum and 100 is maximum
+float deepconf_calculate_percentile(std::vector<float> & values, int percentile) {
+    if (values.empty()) {
+        return 0.0f;
+    }
+    
+    // Sort the values
+    std::sort(values.begin(), values.end());
+    
+    // Clamp percentile to valid range
+    percentile = std::max(0, std::min(100, percentile));
+    
+    // Calculate the index
+    float index = (percentile / 100.0f) * (values.size() - 1);
+    int lower_index = static_cast<int>(std::floor(index));
+    int upper_index = static_cast<int>(std::ceil(index));
+    
+    // Handle edge cases
+    if (lower_index < 0) lower_index = 0;
+    if (upper_index >= (int)values.size()) upper_index = values.size() - 1;
+    
+    // If indices are the same, return the value
+    if (lower_index == upper_index) {
+        return values[lower_index];
+    }
+    
+    // Linear interpolation between the two values
+    float fraction = index - lower_index;
+    return values[lower_index] + fraction * (values[upper_index] - values[lower_index]);
+}
 bool deepconf_update(deepconf_state * state, float token_confidence) {
     if (!state || !state->params.enabled) {
         return true; // Continue generation
@@ -260,6 +292,7 @@ bool deepconf_update(deepconf_state * state, float token_confidence) {
     if (count >= state->params.window_size) {
         // Only check threshold once window is full
         LOG_INF("DeepConf Update: Window full, checking threshold...\n");
+        LOG_INF("DeepConf Update: Comparing group_conf (%.6f) with threshold (%.6f)\n", state->last_group_confidence, state->params.threshold);
         if (state->last_group_confidence < state->params.threshold) {
             LOG_INF("DeepConf Update: Triggering early stop (group_conf < threshold)\n");
             state->should_stop = true;
@@ -303,13 +336,20 @@ float deepconf_get_group_confidence(const deepconf_state * state) {
 
 bool deepconf_should_stop(const deepconf_state * state) {
     if (!state || !state->params.enabled) {
+        LOG_DBG("DeepConf: should_stop=false (disabled or null state)\n");
         return false;
     }
     
     // If warmup is enabled and we are in collection mode, never stop
     if (state->params.warmup_enabled && state->warmup_mode == deepconf_state::DEEPCONF_WARMUP_MODE_COLLECT) {
+        LOG_DBG("DeepConf: should_stop=false (in warmup collection mode)\n");
         return false;
     }
+    
+    LOG_DBG("DeepConf: should_stop=%s (threshold=%.6f, last_group_conf=%.6f)\n",
+               state->should_stop ? "true" : "false",
+               state->params.threshold,
+               state->last_group_confidence);
     
     return state->should_stop;
 }
@@ -349,6 +389,34 @@ void deepconf_set_stopping_threshold(deepconf_state * state, float threshold) {
     if (state) {
         state->params.threshold = threshold;
     }
+}
+
+// Set adaptive threshold based on warmup scores and desired aggressiveness
+// state: DeepConf state with collected warmup scores
+// percentile: Desired percentile (e.g., 90 for aggressive "DeepConf-low", 10 for conservative "DeepConf-high")
+void deepconf_set_adaptive_threshold(deepconf_state * state, int percentile) {
+    if (!state || !state->params.warmup_enabled) {
+        return;
+    }
+    
+    // Convert ring_buffer to vector for percentile calculation
+    std::vector<float> warmup_scores = state->confidence_window->to_vector();
+    
+    // Check if we have enough scores
+    if (warmup_scores.size() < (size_t)state->params.warmup_traces) {
+        LOG_WRN("Not enough warmup scores collected (%zu < %d), using default threshold\n",
+                warmup_scores.size(), state->params.warmup_traces);
+        return;
+    }
+    
+    // Calculate the percentile-based threshold
+    float adaptive_threshold = deepconf_calculate_percentile(warmup_scores, percentile);
+    
+    // Set the calculated threshold
+    deepconf_set_stopping_threshold(state, adaptive_threshold);
+    
+    LOG_INF("Set adaptive threshold to %.6f based on %d percentile of %zu warmup scores\n",
+            adaptive_threshold, percentile, warmup_scores.size());
 }
 
 bool deepconf_validate_params(deepconf_params & params) {

@@ -13,7 +13,6 @@ import re
 import subprocess
 import argparse
 import os
-import sys
 from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -27,6 +26,7 @@ try:
 except ImportError:
     HAS_REQUESTS = False
     print("Warning: 'requests' not installed. Install with: pip install requests")
+    exit(1)
 
 try:
     from datasets import load_dataset
@@ -34,6 +34,7 @@ try:
 except ImportError:
     HAS_DATASETS = False
     print("Warning: 'datasets' not installed. Install with: pip install datasets")
+    exit(1)
 
 
 @dataclass
@@ -43,26 +44,53 @@ class DeepConfConfig:
     threshold: float = 0.8
     window_size: int = 8
     top_k: int = 4
+    # Offline Warmup parameters
+    warmup_enabled: bool = False
+    warmup_traces: int = 16
+    warmup_percentile: int = 90
     
     def to_cli_args(self) -> List[str]:
         """Convert to command-line arguments for llama-cli."""
         if not self.enabled:
             return []
-        return [
-            "--deepconf",
-            "--deepconf-threshold", str(self.threshold),
-            "--deepconf-window", str(self.window_size),
-            "--deepconf-top-k", str(self.top_k)
-        ]
+        
+        args = ["--deepconf"]
+        
+        # Add Offline Warmup parameters if enabled
+        if self.warmup_enabled:
+            args.extend([
+                "--deepconf-warmup-enabled",
+                "--deepconf-warmup-traces", str(self.warmup_traces),
+                "--deepconf-warmup-percentile", str(self.warmup_percentile)
+            ])
+        else:
+            # Only add static threshold parameters if warmup is not enabled
+            args.extend([
+                "--deepconf-threshold", str(self.threshold),
+                "--deepconf-window", str(self.window_size),
+                "--deepconf-top-k", str(self.top_k)
+            ])
+        
+        return args
     
     def to_api_params(self) -> Dict[str, Any]:
         """Convert to API parameters for llama-server."""
-        return {
-            "deepconf_enabled": self.enabled,
-            "deepconf_threshold": self.threshold,
-            "deepconf_window_size": self.window_size,
-            "deepconf_top_k": self.top_k
+        params: Dict[str, Any] = {
+            "deepconf_enabled": bool(self.enabled)
         }
+        
+        # Add Offline Warmup parameters if enabled
+        if self.warmup_enabled:
+            params["deepconf_warmup_enabled"] = bool(self.warmup_enabled)
+            params["deepconf_warmup_traces"] = int(self.warmup_traces)
+            params["deepconf_warmup_percentile"] = int(self.warmup_percentile)
+        else:
+            # Only add static threshold parameters if warmup is not enabled
+            params["deepconf_threshold"] = float(self.threshold)
+            params["deepconf_window_size"] = int(self.window_size)
+            params["deepconf_top_k"] = int(self.top_k)
+        
+        return params
 
 
 @dataclass
@@ -78,7 +106,7 @@ class InferenceResult:
     generation_time: float
     deepconf_config: DeepConfConfig
     early_stopped: bool = False
-    confidence_scores: List[float] = None
+    confidence_scores: Optional[List[float]] = None
 
 
 class AIMEDataset:
@@ -111,7 +139,17 @@ class AIMEDataset:
                 # Convert to consistent format
                 for i, p in enumerate(self.problems):
                     p['id'] = f"{self.subset}_{i+1}" if self.subset != "both" else f"problem_{i+1}"
-                    p['answer'] = int(p['answer']) if isinstance(p['answer'], str) else p['answer']
+                    if isinstance(p['answer'], str):
+                        match = re.search(r'\d+', p['answer'])
+                        if match:
+                            try:
+                                p['answer'] = int(match.group(0))
+                            except ValueError:
+                                print(f"Warning: Could not convert answer '{p['answer']}' to int. Setting to None.")
+                                p['answer'] = None
+                        else:
+                            print(f"Warning: No digits found in answer '{p['answer']}'. Setting to None.")
+                            p['answer'] = None
                 
                 print(f"Loaded {len(self.problems)} problems from Hugging Face")
                 return
@@ -351,6 +389,10 @@ class LlamaInference:
             **deepconf_config.to_api_params()
         }
         
+        # Enable verbose output for DeepConf to get detailed stats
+        if deepconf_config.enabled:
+            payload["verbose"] = True
+        
         try:
             response = requests.post(
                 f"{self.server_url}/v1/completions",
@@ -366,11 +408,11 @@ class LlamaInference:
             
             # Extract DeepConf info if available
             deepconf_info = {}
-            if 'deepconf_stats' in data:
-                deepconf_info = data['deepconf_stats']
+            if 'deepconf' in data:
+                deepconf_info = data['deepconf']
             
             return generated_text, generation_time, deepconf_info
-            
+
         except Exception as e:
             print(f"API error: {e}")
             return "", 0.0, {'error': str(e)}
@@ -386,10 +428,11 @@ class LlamaInference:
 class AIMEBenchmark:
     """Main benchmark orchestrator."""
     
-    def __init__(self, 
+    def __init__(self,
                  model_path: str,
                  output_dir: str = "results",
                  use_server: bool = False,
+                 server_url: str = "http://localhost:8080",
                  verbose: bool = False):
         """Initialize benchmark."""
         self.model_path = model_path
@@ -402,6 +445,7 @@ class AIMEBenchmark:
         self.inference = LlamaInference(
             model_path=model_path,
             use_server=use_server,
+            server_url=server_url,
             verbose=verbose
         )
         self.results = []
@@ -430,7 +474,7 @@ class AIMEBenchmark:
         
         # Count tokens (approximate)
         tokens_generated = len(generated_text.split())
-        
+        print(str(deepconf_info))
         # Create result
         result = InferenceResult(
             problem_id=problem['id'],
@@ -442,12 +486,15 @@ class AIMEBenchmark:
             tokens_generated=tokens_generated,
             generation_time=generation_time,
             deepconf_config=deepconf_config,
-            early_stopped=deepconf_info.get('early_stopped', False),
+            early_stopped=deepconf_info.get('early_stop_triggered', False),
             confidence_scores=deepconf_info.get('confidence_scores', [])
         )
         
+        if self.verbose and result.deepconf_config.enabled and result.confidence_scores:
+            print(f"    DeepConf scores (first 10): {result.confidence_scores[:10]}...")
+            print(f"    DeepConf scores (last 10): {result.confidence_scores[-10:]}...")
         return result
-    
+
     def run_experiment(self,
                       deepconf_configs: List[DeepConfConfig],
                       num_problems: Optional[int] = None,
@@ -470,7 +517,13 @@ class AIMEBenchmark:
         print("="*60)
         
         for config_idx, config in enumerate(deepconf_configs):
-            config_name = f"DeepConf(threshold={config.threshold}, window={config.window_size})" if config.enabled else "Baseline"
+            if config.enabled:
+                if config.warmup_enabled:
+                    config_name = f"DeepConf(Warmup, traces={config.warmup_traces}, percentile={config.warmup_percentile})"
+                else:
+                    config_name = f"DeepConf(threshold={config.threshold}, window={config.window_size})"
+            else:
+                config_name = "Baseline"
             print(f"\nConfiguration {config_idx+1}/{len(deepconf_configs)}: {config_name}")
             print("-"*40)
             
@@ -575,7 +628,13 @@ class AIMEBenchmark:
         
         for config_key, config_res in config_results.items():
             config = json.loads(config_key)
-            config_name = f"threshold={config['threshold']}_window={config['window_size']}" if config['enabled'] else "baseline"
+            if config['enabled']:
+                if config.get('warmup_enabled', False):
+                    config_name = f"warmup_traces={config['warmup_traces']}_percentile={config['warmup_percentile']}"
+                else:
+                    config_name = f"threshold={config['threshold']}_window={config['window_size']}"
+            else:
+                config_name = "baseline"
             
             # Calculate metrics
             correct = sum(1 for r in config_res if r.is_correct)
@@ -662,7 +721,36 @@ class AIMEBenchmark:
         )
         
         for config_name, metrics in sorted_configs:
-            print(f"\n{config_name.upper()}:")
+            # Format the display name based on the configuration
+            if config_name == "baseline":
+                display_name = "BASELINE"
+            elif "warmup_traces" in config_name and "percentile" in config_name:
+                # Extract values from the config name more safely
+                try:
+                    parts = config_name.split("_")
+                    if len(parts) >= 2:
+                        # Find the part containing "warmup_traces" and "percentile"
+                        traces_part = None
+                        percentile_part = None
+                        for part in parts:
+                            if "warmup_traces" in part:
+                                traces_part = part
+                            elif "percentile" in part:
+                                percentile_part = part
+                        
+                        if traces_part and percentile_part:
+                            traces = traces_part.split("=")[1] if "=" in traces_part else "unknown"
+                            percentile = percentile_part.split("=")[1] if "=" in percentile_part else "unknown"
+                            display_name = f"WARMUP(TRACES={traces}, PERCENTILE={percentile})"
+                        else:
+                            display_name = config_name.upper()
+                    else:
+                        display_name = config_name.upper()
+                except (IndexError, ValueError):
+                    display_name = config_name.upper()
+            else:
+                display_name = config_name.upper()
+            print(f"\n{display_name}:")
             print(f"  Accuracy: {metrics['accuracy']:.1f}% ({metrics['correct_count']}/{metrics['total_problems']})")
             print(f"  Avg tokens: {metrics['avg_tokens']:.0f}")
             print(f"  Avg time: {metrics['avg_time_seconds']:.2f}s")
@@ -710,12 +798,20 @@ Examples:
     # DeepConf configuration
     parser.add_argument("--deepconf-sweep", action="store_true",
                        help="Test multiple DeepConf configurations")
-    parser.add_argument("--deepconf-threshold", type=float, default=0.8,
+    parser.add_argument("--deepconf-threshold", type=float, default=17.0,
                        help="DeepConf threshold (if not sweeping)")
-    parser.add_argument("--deepconf-window", type=int, default=8,
+    parser.add_argument("--deepconf-window", type=int, default=2048,
                        help="DeepConf window size (if not sweeping)")
-    parser.add_argument("--deepconf-top-k", type=int, default=4,
+    parser.add_argument("--deepconf-top-k", type=int, default=20,
                        help="DeepConf top-k value (if not sweeping)")
+    
+    # DeepConf Offline Warmup parameters
+    parser.add_argument("--deepconf-warmup", action="store_true",
+                       help="Enable DeepConf Offline Warmup for dynamic threshold")
+    parser.add_argument("--deepconf-warmup-traces", type=int, default=16,
+                       help="Number of traces for Offline Warmup (default: 16)")
+    parser.add_argument("--deepconf-warmup-percentile", type=int, default=90,
+                       help="Percentile for dynamic threshold (90=DeepConf-low, 10=DeepConf-high, default: 90)")
     
     # Server mode
     parser.add_argument("--use-server", action="store_true",
@@ -734,6 +830,7 @@ Examples:
         model_path=args.model,
         output_dir=args.output_dir,
         use_server=args.use_server,
+        server_url=args.server_url,
         verbose=args.verbose
     )
     
@@ -747,10 +844,13 @@ Examples:
         # Test multiple configurations
         configs = [
             DeepConfConfig(enabled=False),  # Baseline
-            DeepConfConfig(enabled=True, threshold=0.6, window_size=4, top_k=4),
-            DeepConfConfig(enabled=True, threshold=0.8, window_size=8, top_k=4),
-            DeepConfConfig(enabled=True, threshold=1.0, window_size=8, top_k=8),
-            DeepConfConfig(enabled=True, threshold=1.2, window_size=16, top_k=8),
+            DeepConfConfig(enabled=True, threshold=10.0, window_size=2048, top_k=20),
+            DeepConfConfig(enabled=True, threshold=17.0, window_size=2048, top_k=20),
+            DeepConfConfig(enabled=True, threshold=25.0, window_size=2048, top_k=20),
+            DeepConfConfig(enabled=True, threshold=30.0, window_size=2048, top_k=20),
+            # Test dynamic threshold with Offline Warmup
+            DeepConfConfig(enabled=True, warmup_enabled=True, warmup_traces=16, warmup_percentile=90),  # DeepConf-low (aggressive)
+            DeepConfConfig(enabled=True, warmup_enabled=True, warmup_traces=16, warmup_percentile=10),  # DeepConf-high (conservative)
         ]
     else:
         # Test baseline vs single configuration
@@ -760,7 +860,10 @@ Examples:
                 enabled=True,
                 threshold=args.deepconf_threshold,
                 window_size=args.deepconf_window,
-                top_k=args.deepconf_top_k
+                top_k=args.deepconf_top_k,
+                warmup_enabled=args.deepconf_warmup,
+                warmup_traces=args.deepconf_warmup_traces,
+                warmup_percentile=args.deepconf_warmup_percentile
             )
         ]
     
@@ -768,6 +871,8 @@ Examples:
     print(f"Starting AIME 2025 DeepConf Benchmark")
     print(f"Model: {args.model}")
     print(f"Mode: {'Server API' if args.use_server else 'CLI'}")
+    if args.use_server:
+        print(f"Server URL: {args.server_url}")
     print(f"Prompt template: {args.prompt_template}")
     
     report = benchmark.run_experiment(

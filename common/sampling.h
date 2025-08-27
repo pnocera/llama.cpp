@@ -125,7 +125,7 @@ void common_sampler_deepconf_calculate_consensus(struct common_sampler * gsmpl);
 bool common_sampler_deepconf_check_consensus(const struct common_sampler * gsmpl);
 
 // extended sampling implementation that returns confidence
-float common_sampler_sample_with_confidence(struct common_sampler * gsmpl, struct llama_context * ctx, llama_token_data_array * candidates, llama_token * token_id);
+float common_sampler_sample_with_confidence(struct common_sampler * gsmpl, struct llama_context * ctx, llama_token_data_array * candidates, int32_t * token_id);
 
 // get DeepConf statistics for debugging
 std::string common_sampler_deepconf_stats(const struct common_sampler * gsmpl);
