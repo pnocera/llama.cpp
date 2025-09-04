@@ -13,9 +13,8 @@ import re
 import subprocess
 import argparse
 import os
-import sys
 from typing import Dict, List, Tuple, Optional, Any
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 import statistics
 from datetime import datetime
@@ -27,6 +26,7 @@ try:
 except ImportError:
     HAS_REQUESTS = False
     print("Warning: 'requests' not installed. Install with: pip install requests")
+    exit(1)
 
 try:
     from datasets import load_dataset
@@ -34,6 +34,7 @@ try:
 except ImportError:
     HAS_DATASETS = False
     print("Warning: 'datasets' not installed. Install with: pip install datasets")
+    exit(1)
 
 
 @dataclass
@@ -43,26 +44,68 @@ class DeepConfConfig:
     threshold: float = 0.8
     window_size: int = 8
     top_k: int = 4
+    # Offline Warmup parameters
+    warmup_enabled: bool = False
+    warmup_traces: int = 16
+    warmup_percentile: int = 90
+    # Offline Filtering/Voting parameters
+    num_gen_traces: int = 1
+    gamma_filter_percent: float = 20.0
     
     def to_cli_args(self) -> List[str]:
         """Convert to command-line arguments for llama-cli."""
         if not self.enabled:
             return []
-        return [
-            "--deepconf",
-            "--deepconf-threshold", str(self.threshold),
-            "--deepconf-window", str(self.window_size),
-            "--deepconf-top-k", str(self.top_k)
-        ]
+        
+        args = ["--deepconf"]
+        
+        # Add Offline Warmup parameters if enabled
+        if self.warmup_enabled:
+            args.extend([
+                "--deepconf-warmup-enabled",
+                "--deepconf-warmup-traces", str(self.warmup_traces),
+                "--deepconf-warmup-percentile", str(self.warmup_percentile)
+            ])
+        else:
+            # Only add static threshold parameters if warmup is not enabled
+            args.extend([
+                "--deepconf-threshold", str(self.threshold),
+                "--deepconf-window", str(self.window_size),
+                "--deepconf-top-k", str(self.top_k)
+            ])
+        
+        # Add Offline Filtering/Voting parameters
+        if self.num_gen_traces > 1:
+            args.extend([
+                "--deepconf-n-gen-traces", str(self.num_gen_traces),
+                "--deepconf-gamma-filter-percent", str(self.gamma_filter_percent)
+            ])
+        
+        return args
     
     def to_api_params(self) -> Dict[str, Any]:
         """Convert to API parameters for llama-server."""
-        return {
-            "deepconf_enabled": self.enabled,
-            "deepconf_threshold": self.threshold,
-            "deepconf_window_size": self.window_size,
-            "deepconf_top_k": self.top_k
+        params: Dict[str, Any] = {
+            "deepconf_enabled": bool(self.enabled)
         }
+        
+        # Add Offline Warmup parameters if enabled
+        if self.warmup_enabled:
+            params["deepconf_warmup_enabled"] = bool(self.warmup_enabled)
+            params["deepconf_warmup_traces"] = int(self.warmup_traces)
+            params["deepconf_warmup_percentile"] = int(self.warmup_percentile)
+        else:
+            # Only add static threshold parameters if warmup is not enabled
+            params["deepconf_threshold"] = float(self.threshold)
+            params["deepconf_window_size"] = int(self.window_size)
+            params["deepconf_top_k"] = int(self.top_k)
+        
+        # Add Offline Filtering/Voting parameters
+        if self.num_gen_traces > 1:
+            params["deepconf_n_gen_traces"] = int(self.num_gen_traces)
+            params["deepconf_gamma_filter_percent"] = float(self.gamma_filter_percent)
+        
+        return params
 
 
 @dataclass
@@ -78,7 +121,8 @@ class InferenceResult:
     generation_time: float
     deepconf_config: DeepConfConfig
     early_stopped: bool = False
-    confidence_scores: List[float] = None
+    confidence_scores: Optional[List[float]] = None
+    deepconf_info: Dict[str, Any] = field(default_factory=dict)
 
 
 class AIMEDataset:
@@ -111,7 +155,17 @@ class AIMEDataset:
                 # Convert to consistent format
                 for i, p in enumerate(self.problems):
                     p['id'] = f"{self.subset}_{i+1}" if self.subset != "both" else f"problem_{i+1}"
-                    p['answer'] = int(p['answer']) if isinstance(p['answer'], str) else p['answer']
+                    if isinstance(p['answer'], str):
+                        match = re.search(r'\d+', p['answer'])
+                        if match:
+                            try:
+                                p['answer'] = int(match.group(0))
+                            except ValueError:
+                                print(f"Warning: Could not convert answer '{p['answer']}' to int. Setting to None.")
+                                p['answer'] = None
+                        else:
+                            print(f"Warning: No digits found in answer '{p['answer']}'. Setting to None.")
+                            p['answer'] = None
                 
                 print(f"Loaded {len(self.problems)} problems from Hugging Face")
                 return
@@ -244,13 +298,14 @@ Solution:
 class LlamaInference:
     """Handle inference using llama.cpp."""
     
-    def __init__(self, 
+    def __init__(self,
                  model_path: str,
                  use_server: bool = False,
                  server_url: str = "http://localhost:8080",
                  max_tokens: int = 2048,
                  temperature: float = 0.1,
-                 verbose: bool = False):
+                 verbose: bool = False,
+                 ngl: int = 0):
         """
         Initialize inference handler.
         
@@ -261,6 +316,7 @@ class LlamaInference:
             max_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             verbose: Print debug information
+            ngl: Number of GPU layers to offload
         """
         self.model_path = model_path
         self.use_server = use_server
@@ -268,6 +324,7 @@ class LlamaInference:
         self.max_tokens = max_tokens
         self.temperature = temperature
         self.verbose = verbose
+        self.ngl = ngl
         
         # Check if model exists
         if not use_server and not os.path.exists(model_path):
@@ -295,6 +352,9 @@ class LlamaInference:
             "--no-display-prompt",
             "-s", "1234",  # Fixed seed for reproducibility
         ]
+        
+        if self.ngl > 0:
+            cmd.extend(["-ngl", str(self.ngl)])
         
         # Add DeepConf parameters
         cmd.extend(deepconf_config.to_cli_args())
@@ -351,6 +411,14 @@ class LlamaInference:
             **deepconf_config.to_api_params()
         }
         
+        # Enable verbose output for DeepConf to get detailed stats
+        if deepconf_config.enabled:
+            payload["verbose"] = True
+        
+        # Debug print to see what parameters are being sent
+        if self.verbose and deepconf_config.enabled:
+            print(f"    Sending DeepConf API params: {deepconf_config.to_api_params()}")
+        
         try:
             response = requests.post(
                 f"{self.server_url}/v1/completions",
@@ -366,11 +434,11 @@ class LlamaInference:
             
             # Extract DeepConf info if available
             deepconf_info = {}
-            if 'deepconf_stats' in data:
-                deepconf_info = data['deepconf_stats']
+            if 'deepconf' in data:
+                deepconf_info = data['deepconf']
             
             return generated_text, generation_time, deepconf_info
-            
+
         except Exception as e:
             print(f"API error: {e}")
             return "", 0.0, {'error': str(e)}
@@ -386,11 +454,13 @@ class LlamaInference:
 class AIMEBenchmark:
     """Main benchmark orchestrator."""
     
-    def __init__(self, 
+    def __init__(self,
                  model_path: str,
                  output_dir: str = "results",
                  use_server: bool = False,
-                 verbose: bool = False):
+                 server_url: str = "http://localhost:8080",
+                 verbose: bool = False,
+                 ngl: int = 99):
         """Initialize benchmark."""
         self.model_path = model_path
         self.output_dir = Path(output_dir)
@@ -402,7 +472,9 @@ class AIMEBenchmark:
         self.inference = LlamaInference(
             model_path=model_path,
             use_server=use_server,
-            verbose=verbose
+            server_url=server_url,
+            verbose=verbose,
+            ngl=ngl
         )
         self.results = []
     
@@ -430,7 +502,7 @@ class AIMEBenchmark:
         
         # Count tokens (approximate)
         tokens_generated = len(generated_text.split())
-        
+        print(str(deepconf_info))
         # Create result
         result = InferenceResult(
             problem_id=problem['id'],
@@ -442,12 +514,16 @@ class AIMEBenchmark:
             tokens_generated=tokens_generated,
             generation_time=generation_time,
             deepconf_config=deepconf_config,
-            early_stopped=deepconf_info.get('early_stopped', False),
-            confidence_scores=deepconf_info.get('confidence_scores', [])
+            early_stopped=deepconf_info.get('early_stop_triggered', False),
+            confidence_scores=deepconf_info.get('confidence_scores', []),
+            deepconf_info=deepconf_info
         )
         
+        if self.verbose and result.deepconf_config.enabled and result.confidence_scores:
+            print(f"    DeepConf scores (first 10): {result.confidence_scores[:10]}...")
+            print(f"    DeepConf scores (last 10): {result.confidence_scores[-10:]}...")
         return result
-    
+
     def run_experiment(self,
                       deepconf_configs: List[DeepConfConfig],
                       num_problems: Optional[int] = None,
@@ -469,8 +545,69 @@ class AIMEBenchmark:
         print(f"\nRunning benchmark on {len(problems)} problems with {len(deepconf_configs)} configurations")
         print("="*60)
         
-        for config_idx, config in enumerate(deepconf_configs):
-            config_name = f"DeepConf(threshold={config.threshold}, window={config.window_size})" if config.enabled else "Baseline"
+        # Debug print configurations
+        if self.verbose:
+            print("\nDebug: Configurations being tested:")
+            for i, config in enumerate(deepconf_configs):
+                print(f"  Config {i}: {config}")
+            print()
+        
+        for config_idx, original_config in enumerate(deepconf_configs):
+            config = original_config # Use a mutable copy for potential threshold adjustment
+
+            if config.enabled and config.warmup_enabled and self.inference.use_server:
+                print(f"\nPerforming DeepConf Warmup for config {config_idx+1} (Server API mode)...")
+                warmup_scores = []
+                # Create a warmup config that enables DeepConf on the server side
+                # but uses the warmup parameters from the original config.
+                # The server will perform the warmup and return min_group_confidence.
+                warmup_config = DeepConfConfig(
+                    enabled=True, # Enable DeepConf for the server to return deepconf_info
+                    warmup_enabled=True,
+                    warmup_traces=config.warmup_traces,
+                    warmup_percentile=config.warmup_percentile
+                )
+                
+                for prob_idx, problem in enumerate(problems):
+                    if self.verbose:
+                        print(f"  Warmup Problem {prob_idx+1}/{len(problems)}: {problem['id']}", end=" ... ")
+                    
+                    # Run inference with the warmup config
+                    result = self.run_single_problem(problem, warmup_config, prompt_template)
+                    
+                    # Extract min_group_confidence from deepconf_info returned by the server
+                    min_group_conf = result.deepconf_info.get('min_group_confidence', config.threshold)
+                    
+                    if min_group_conf > 0: # Only add valid scores
+                        warmup_scores.append(min_group_conf)
+                    
+                    if self.verbose:
+                        print(f"C_least: {min_group_conf:.6f}")
+                
+                if not warmup_scores:
+                    print("Warning: No valid warmup scores collected. Using default threshold.")
+                    dynamic_threshold = config.threshold # Fallback to default
+                else:
+                    # Calculate dynamic threshold
+                    warmup_scores.sort()
+                    percentile_index = int(len(warmup_scores) * (config.warmup_percentile / 100.0))
+                    dynamic_threshold = warmup_scores[min(percentile_index, len(warmup_scores) - 1)]
+                    print(f"Calculated dynamic threshold: {dynamic_threshold:.6f} (from {config.warmup_percentile}th percentile of {len(warmup_scores)} scores)")
+                
+                # Update the config for actual runs with the dynamic threshold
+                config.threshold = dynamic_threshold
+                config.warmup_enabled = False # Disable warmup for actual runs
+                config_name = f"DeepConf(DynamicThreshold, threshold={config.threshold:.2f}, window={config.window_size})"
+            elif config.enabled:
+                if config.warmup_enabled:
+                    config_name = f"DeepConf(Warmup, traces={config.warmup_traces}, percentile={config.warmup_percentile})"
+                elif config.num_gen_traces > 1:
+                    config_name = f"DeepConf(Offline, traces={config.num_gen_traces}, gamma={config.gamma_filter_percent})"
+                else:
+                    config_name = f"DeepConf(threshold={config.threshold}, window={config.window_size})"
+            else:
+                config_name = "Baseline"
+            
             print(f"\nConfiguration {config_idx+1}/{len(deepconf_configs)}: {config_name}")
             print("-"*40)
             
@@ -575,7 +712,15 @@ class AIMEBenchmark:
         
         for config_key, config_res in config_results.items():
             config = json.loads(config_key)
-            config_name = f"threshold={config['threshold']}_window={config['window_size']}" if config['enabled'] else "baseline"
+            if config['enabled']:
+                if config.get('warmup_enabled', False):
+                    config_name = f"warmup_traces={config['warmup_traces']}_percentile={config['warmup_percentile']}"
+                elif config.get('num_gen_traces', 1) > 1:
+                    config_name = f"offline_traces={config['num_gen_traces']}_gamma={config['gamma_filter_percent']}"
+                else:
+                    config_name = f"threshold={config['threshold']}_window={config['window_size']}"
+            else:
+                config_name = "baseline"
             
             # Calculate metrics
             correct = sum(1 for r in config_res if r.is_correct)
@@ -662,7 +807,58 @@ class AIMEBenchmark:
         )
         
         for config_name, metrics in sorted_configs:
-            print(f"\n{config_name.upper()}:")
+            # Format the display name based on the configuration
+            if config_name == "baseline":
+                display_name = "BASELINE"
+            elif "warmup_traces" in config_name and "percentile" in config_name:
+                # Extract values from the config name more safely
+                try:
+                    parts = config_name.split("_")
+                    if len(parts) >= 2:
+                        # Find the part containing "warmup_traces" and "percentile"
+                        traces_part = None
+                        percentile_part = None
+                        for part in parts:
+                            if "warmup_traces" in part:
+                                traces_part = part
+                            elif "percentile" in part:
+                                percentile_part = part
+                        
+                        if traces_part and percentile_part:
+                            traces = traces_part.split("=")[1] if "=" in traces_part else "unknown"
+                            percentile = percentile_part.split("=")[1] if "=" in percentile_part else "unknown"
+                            display_name = f"WARMUP(TRACES={traces}, PERCENTILE={percentile})"
+                        else:
+                            display_name = config_name.upper()
+                    else:
+                        display_name = config_name.upper()
+                except (IndexError, ValueError):
+                    display_name = config_name.upper()
+            elif "offline_traces" in config_name and "gamma" in config_name:
+                try:
+                    parts = config_name.split("_")
+                    if len(parts) >= 2:
+                        traces_part = None
+                        gamma_part = None
+                        for part in parts:
+                            if "offline_traces" in part:
+                                traces_part = part
+                            elif "gamma" in part:
+                                gamma_part = part
+                        
+                        if traces_part and gamma_part:
+                            traces = traces_part.split("=")[1] if "=" in traces_part else "unknown"
+                            gamma = gamma_part.split("=")[1] if "=" in gamma_part else "unknown"
+                            display_name = f"OFFLINE(TRACES={traces}, GAMMA={gamma})"
+                        else:
+                            display_name = config_name.upper()
+                    else:
+                        display_name = config_name.upper()
+                except (IndexError, ValueError):
+                    display_name = config_name.upper()
+            else:
+                display_name = config_name.upper()
+            print(f"\n{display_name}:")
             print(f"  Accuracy: {metrics['accuracy']:.1f}% ({metrics['correct_count']}/{metrics['total_problems']})")
             print(f"  Avg tokens: {metrics['avg_tokens']:.0f}")
             print(f"  Avg time: {metrics['avg_time_seconds']:.2f}s")
@@ -712,16 +908,33 @@ Examples:
                        help="Test multiple DeepConf configurations")
     parser.add_argument("--deepconf-threshold", type=float, default=0.8,
                        help="DeepConf threshold (if not sweeping)")
-    parser.add_argument("--deepconf-window", type=int, default=8,
+    parser.add_argument("--deepconf-window", type=int, default=128,
                        help="DeepConf window size (if not sweeping)")
-    parser.add_argument("--deepconf-top-k", type=int, default=4,
+    parser.add_argument("--deepconf-top-k", type=int, default=20,
                        help="DeepConf top-k value (if not sweeping)")
     
+    # DeepConf Offline Warmup parameters
+    parser.add_argument("--deepconf-warmup", action="store_true",
+                       help="Enable DeepConf Offline Warmup for dynamic threshold")
+    parser.add_argument("--deepconf-warmup-traces", type=int, default=16,
+                       help="Number of traces for Offline Warmup (default: 16)")
+    parser.add_argument("--deepconf-warmup-percentile", type=int, default=90,
+                       help="Percentile for dynamic threshold (90=DeepConf-low, 10=DeepConf-high, default: 90)")
+    
+    # DeepConf Offline Filtering/Voting parameters
+    parser.add_argument("--deepconf-n-gen-traces", type=int, default=1,
+                       help="DeepConf number of independent generation traces for offline filtering/voting (default: 1)")
+    parser.add_argument("--deepconf-gamma-filter-percent", type=float, default=20.0,
+                       help="DeepConf percentage of lowest confidence traces to filter out (default: 20.0, range: 0.0-100.0)")
+
     # Server mode
     parser.add_argument("--use-server", action="store_true",
                        help="Use llama-server API instead of CLI")
     parser.add_argument("--server-url", default="http://localhost:8080",
                        help="Server URL if using API mode")
+    
+    # GPU offloading
+    parser.add_argument("--ngl", type=int, default=0, help="Number of layers to offload to GPU (default: 0)")
     
     # Other options
     parser.add_argument("--verbose", action="store_true", help="Verbose output")
@@ -734,7 +947,9 @@ Examples:
         model_path=args.model,
         output_dir=args.output_dir,
         use_server=args.use_server,
-        verbose=args.verbose
+        server_url=args.server_url,
+        verbose=args.verbose,
+        ngl=args.ngl
     )
     
     # Save dataset if requested
@@ -747,27 +962,76 @@ Examples:
         # Test multiple configurations
         configs = [
             DeepConfConfig(enabled=False),  # Baseline
-            DeepConfConfig(enabled=True, threshold=0.6, window_size=4, top_k=4),
-            DeepConfConfig(enabled=True, threshold=0.8, window_size=8, top_k=4),
-            DeepConfConfig(enabled=True, threshold=1.0, window_size=8, top_k=8),
-            DeepConfConfig(enabled=True, threshold=1.2, window_size=16, top_k=8),
+            DeepConfConfig(enabled=True, threshold=10.0, window_size=2048, top_k=20),
+            DeepConfConfig(enabled=True, threshold=17.0, window_size=2048, top_k=20),
+            DeepConfConfig(enabled=True, threshold=25.0, window_size=2048, top_k=20),
+            DeepConfConfig(enabled=True, threshold=30.0, window_size=2048, top_k=20),
+            # Test dynamic threshold with Offline Warmup
+            DeepConfConfig(enabled=True, warmup_enabled=True, warmup_traces=16, warmup_percentile=90),  # DeepConf-low (aggressive)
+            DeepConfConfig(enabled=True, warmup_enabled=True, warmup_traces=16, warmup_percentile=10),  # DeepConf-high (conservative)
+            # Test Offline Filtering/Voting
+            DeepConfConfig(enabled=True, num_gen_traces=5, gamma_filter_percent=20.0),
+            DeepConfConfig(enabled=True, num_gen_traces=5, gamma_filter_percent=0.0),
+            DeepConfConfig(enabled=True, num_gen_traces=5, gamma_filter_percent=50.0),
         ]
     else:
-        # Test baseline vs single configuration
-        configs = [
-            DeepConfConfig(enabled=False),  # Baseline
-            DeepConfConfig(
-                enabled=True,
-                threshold=args.deepconf_threshold,
-                window_size=args.deepconf_window,
-                top_k=args.deepconf_top_k
-            )
-        ]
+        # Test baseline vs single configuration based on provided arguments
+        configs = [DeepConfConfig(enabled=False)]  # Always include baseline
+
+        deepconf_run_config = DeepConfConfig(enabled=True)
+
+        # Prioritize Offline Filtering/Voting if num_gen_traces > 1
+        if args.deepconf_n_gen_traces > 1:
+            # Offline Filtering/Voting mode
+            deepconf_run_config.num_gen_traces = args.deepconf_n_gen_traces
+            deepconf_run_config.gamma_filter_percent = args.deepconf_gamma_filter_percent
+            deepconf_run_config.warmup_enabled = False # Explicitly disable warmup
+            # Use provided static thresholding parameters for individual traces
+            deepconf_run_config.threshold = args.deepconf_threshold
+            deepconf_run_config.window_size = args.deepconf_window
+            deepconf_run_config.top_k = args.deepconf_top_k
+        elif args.deepconf_warmup:
+            # Offline Warmup (dynamic threshold) mode
+            deepconf_run_config.warmup_enabled = True
+            deepconf_run_config.warmup_traces = args.deepconf_warmup_traces
+            deepconf_run_config.warmup_percentile = args.deepconf_warmup_percentile
+            # Ensure other DeepConf parameters are at their defaults or explicitly unset if not used
+            deepconf_run_config.threshold = 0.8 # Default
+            deepconf_run_config.window_size = 8 # Default
+            deepconf_run_config.top_k = 4 # Default
+            deepconf_run_config.num_gen_traces = 1 # Default
+            deepconf_run_config.gamma_filter_percent = 20.0 # Default
+        else:
+            # Static thresholding mode (default if no other DeepConf args specified)
+            deepconf_run_config.threshold = args.deepconf_threshold
+            deepconf_run_config.window_size = args.deepconf_window
+            deepconf_run_config.top_k = args.deepconf_top_k
+            # Ensure other DeepConf parameters are at their defaults or explicitly unset if not used
+            deepconf_run_config.warmup_enabled = False
+            deepconf_run_config.warmup_traces = 16 # Default
+            deepconf_run_config.warmup_percentile = 90 # Default
+            deepconf_run_config.num_gen_traces = 1 # Default
+            deepconf_run_config.gamma_filter_percent = 20.0 # Default
+        
+        configs.append(deepconf_run_config)
+    
+    # Debug print arguments
+    if args.verbose:
+        print(f"Debug: Parsed arguments:")
+        print(f"  deepconf_n_gen_traces: {args.deepconf_n_gen_traces}")
+        print(f"  deepconf_gamma_filter_percent: {args.deepconf_gamma_filter_percent}")
+        print(f"  deepconf_warmup: {args.deepconf_warmup}")
+        print(f"  deepconf_threshold: {args.deepconf_threshold}")
+        print(f"  deepconf_window: {args.deepconf_window}")
+        print(f"  deepconf_top_k: {args.deepconf_top_k}")
+        print()
     
     # Run benchmark
     print(f"Starting AIME 2025 DeepConf Benchmark")
     print(f"Model: {args.model}")
     print(f"Mode: {'Server API' if args.use_server else 'CLI'}")
+    if args.use_server:
+        print(f"Server URL: {args.server_url}")
     print(f"Prompt template: {args.prompt_template}")
     
     report = benchmark.run_experiment(
